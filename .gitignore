@@ -7,3 +7,8 @@ vibration_csv_data
 acoustic_csv_data
 current_temp
 current_temp_csv
+
+tests
+.vscode
+.pytest_cache
+__pycache__

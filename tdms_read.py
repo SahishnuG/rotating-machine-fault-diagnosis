@@ -2,8 +2,8 @@
 """
 convert_tdms_to_standard_csv_automap.py
 
-Read TDMS files from ./current_temp, automatically map channels (using TDMS channel/group names)
-to standardized column names, and write standardized CSVs to ./current_temp_csv.
+Read TDMS files from ./current,temp, automatically map channels (using TDMS channel/group names)
+to standardized column names, and write standardized CSVs to ./current_temp.
 
 Requires: nptdms, pandas
 pip install nptdms pandas
