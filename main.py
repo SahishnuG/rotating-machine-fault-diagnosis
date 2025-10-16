@@ -1,358 +1,342 @@
 #!/usr/bin/env python3
 """
-main.py  (updated)
+prepare_and_train_lstm.py
 
-Handles:
- - preprocess: stream vibration CSV in chunks, compute spectrogram windows, extract acoustic features, write TFRecord shards
- - train: load TFRecord shards, create non-overlapping sequences of SEQ_LEN windows, train CNN-LSTM model
+Pipeline that:
+- Reads sensor CSV folders: acoustic, vibration, current_temp
+- Parses filenames of pattern: {load}Nm_{condition}_{severity}.csv  (severity optional)
+- Processes CSVs chunkwise into labeled sliding windows (.npz files)
+- Streams windows into a TensorFlow/Keras LSTM classifier/regressor and trains
+- Designed to be memory-efficient: uses chunked reads and streaming generators
 
-Notes:
- - Replace the placeholder 'label' assignment in preprocess with your real RUL/fault label logic.
- - If acoustic file does not fit memory, request the streaming-acoustic fallback (not implemented here).
+Usage:
+    python3 prepare_and_train_lstm.py --base_dir ./ --out_dir ./processed --make_windows --train
+
+Default folders (relative to --base_dir):
+    ./acoustic_csv_data, ./vibration_csv_data, ./current_temp
 """
 
-import os
 import argparse
+import re
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from scipy.signal import spectrogram
-from tqdm import tqdm
+import os
 import math
-import tensorflow as tf
+import json
 
-# ----------------------------
-# CONFIG - tune for your system
-# ----------------------------
-VIB_PATH = "vibration_csv_data/0Nm_BPFI_03.csv"
-AC_PATH  = "acoustic_csv_data/0Nm_BPFI_03.csv"
+# For model training
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Masking, Bidirectional
+    from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+except Exception:
+    tf = None
 
-# Preprocessing params
-CHUNKSIZE = 1_000_000  # read CSV rows per chunk
-WIN_SIZE = 2048         # samples per spectrogram window (choose to match physical time)
-STEP = 1024             # hop size between windows (50% overlap typical)
-NPERSEG = 512
-NOVERLAP = 256
-SPEC_SHAPE = (128, 128)  # (freq_bins, time_bins)
-SEQ_LEN = 8              # number of windows per LSTM sequence
-TFRECORD_DIR = "tfrecord_shards"
-SHARDSIZE = 2000         # examples per TFRecord shard
-
-# Training params
-BATCH_SIZE = 32
-EPOCHS = 20
-LEARNING_RATE = 1e-3
-
-# TFRecord keys
-FEATURE_SPEC_KEY = "spec"      # float32 spectrogram (h,w,1)
-FEATURE_AC_KEY = "ac_feats"    # float32 acoustic features vector
-FEATURE_LABEL_KEY = "rul"      # float32 target
-
-# ----------------------------
-# UTIL: TFRecord helpers
-# ----------------------------
-def _float_feature(value):
-    return tf.train.Feature(float_list=tf.train.FloatList(value=value.flatten().tolist()))
-
-def write_tfrecord_examples(shard_index, examples, out_dir):
+# ----------------- Utility functions -----------------
+def parse_filename_meta(fname: str):
     """
-    Write a list of examples to a TFRecord file.
-    Each example is a tuple: (spec_array, ac_feat_array, label_float)
+    Parses filenames like '10Nm_inner_mild.csv' or '10Nm_normal.csv' into dict:
+    {load_Nm: int, condition: str, severity: str or None}
     """
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"shard-{shard_index:04d}.tfrecord")
-    with tf.io.TFRecordWriter(path) as writer:
-        for spec, ac, label in examples:
-            spec = np.asarray(spec, dtype=np.float32)  # shape (h,w,1)
-            ac = np.asarray(ac, dtype=np.float32)      # shape (ac_dim,)
-            label = np.asarray([label], dtype=np.float32)
-            feature = {
-                FEATURE_SPEC_KEY: _float_feature(spec),
-                FEATURE_AC_KEY: _float_feature(ac),
-                FEATURE_LABEL_KEY: _float_feature(label)
-            }
-            example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
-            writer.write(example_proto.SerializeToString())
-    return path
+    name = Path(fname).stem
+    # flexible pattern: digits + 'Nm' then _condition then optional _severity
+    m = re.match(r'(\d+)Nm_(\w+)(?:_(\w+))?$', name)
+    if not m:
+        return {"load_Nm": None, "condition": name, "severity": None}
+    load, cond, sev = m.groups()
+    return {"load_Nm": int(load), "condition": cond.lower(), "severity": sev.lower() if sev else None}
 
-# ----------------------------
-# PREPROCESS: spectrogram helper
-# ----------------------------
-def compute_spectrogram(window, fs, nperseg=NPERSEG, noverlap=NOVERLAP, spec_shape=SPEC_SHAPE):
+def canonicalize_current_temp_columns(df: pd.DataFrame):
     """
-    Compute spectrogram for `window` and resize to spec_shape (freq_bins, time_bins).
-    Returns a float32 array shaped (freq_bins, time_bins, 1).
+    Convert weird LabVIEW channel headers into simple safe names.
+    e.g. "/'Log'/'cDAQ.../ai0'" -> "ai0" or "ch0"
     """
-    # safety: ensure window length is sufficient for nperseg
-    if len(window) < 2:
-        h, w = spec_shape
-        return np.zeros((h, w, 1), dtype=np.float32)
-
-    try:
-        f, t, Sxx = spectrogram(window, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    except Exception:
-        # fallback if spectrogram fails for any reason
-        h, w = spec_shape
-        return np.zeros((h, w, 1), dtype=np.float32)
-
-    if Sxx.size == 0:
-        h, w = spec_shape
-        return np.zeros((h, w, 1), dtype=np.float32)
-
-    # log-power & normalize per-window
-    S = np.log1p(Sxx)
-    S_min, S_max = float(S.min()), float(S.max())
-    if S_max - S_min > 1e-12:
-        S = (S - S_min) / (S_max - S_min)
-    else:
-        S = np.zeros_like(S)
-
-    # Interpolate along time axis (each row is a frequency bin)
-    orig_time_bins = S.shape[1]
-    target_time_bins = spec_shape[1]
-    if orig_time_bins == target_time_bins:
-        S_time = S.copy()
-    else:
-        time_xp = np.arange(orig_time_bins)
-        time_target = np.linspace(0, orig_time_bins - 1, target_time_bins)
-        # for each frequency row, interpolate across time
-        S_time = np.vstack([np.interp(time_target, time_xp, S[i, :]) for i in range(S.shape[0])])
-
-    # Now S_time shape is (orig_freq_bins, target_time_bins)
-    # Interpolate along frequency axis to reach target freq bins
-    orig_freq_bins = S_time.shape[0]
-    target_freq_bins = spec_shape[0]
-    if orig_freq_bins == target_freq_bins:
-        S_resized = S_time
-    else:
-        freq_xp = np.arange(orig_freq_bins)
-        freq_target = np.linspace(0, orig_freq_bins - 1, target_freq_bins)
-        # for each time column, interpolate across frequency
-        S_resized = np.vstack([np.interp(freq_target, freq_xp, S_time[:, j]) for j in range(S_time.shape[1])]).T
-
-    S_resized = np.asarray(S_resized, dtype=np.float32)
-    if S_resized.shape != spec_shape:
-        S_resized = np.resize(S_resized, spec_shape).astype(np.float32)
-
-    return S_resized[..., np.newaxis]
-
-# ----------------------------
-# PREPROCESS: streaming windows -> spectrograms -> TFRecord shards
-# ----------------------------
-def streaming_preprocess_to_tfrecord(vib_csv, ac_csv, out_dir=TFRECORD_DIR,
-                                     chunksize=CHUNKSIZE, win_size=WIN_SIZE, step=STEP,
-                                     seq_len=SEQ_LEN, spec_shape=SPEC_SHAPE, shardsize=SHARDSIZE):
-    """
-    Streams CSVs in chunks, builds sliding windows for vibration, computes spectrograms,
-    extracts acoustic features aligned to window centers, and writes TFRecord shards.
-    """
-
-    # Try to load acoustic in memory (ok for a few million rows ~ tens of MB)
-    try:
-        ac_df = pd.read_csv(ac_csv, usecols=["Time_s", "Acoustic_Pa"])
-        ac_times = ac_df["Time_s"].values
-        ac_vals = ac_df["Acoustic_Pa"].values
-        ac_loaded_in_memory = True
-        print(f"Loaded acoustic into memory: {len(ac_vals)} samples")
-    except Exception as e:
-        print("Warning: acoustic file couldn't be loaded entirely; switching to fallback (zero features). Exception:", e)
-        ac_df = None
-        ac_times = None
-        ac_vals = None
-        ac_loaded_in_memory = False
-
-    # Rolling buffer for vibration windows
-    rolling = np.empty((0,), dtype=np.float32)
-    rolling_times = np.empty((0,), dtype=np.float64)
-    shard_idx = 0
-    examples_buffer = []
-
-    # Estimate sample_rate using first two rows
-    sample_rate = None
-    tmp = pd.read_csv(vib_csv, usecols=["Time_s"], nrows=2).reset_index(drop=True)
-    if len(tmp) >= 2:
-        dt = tmp["Time_s"].iloc[1] - tmp["Time_s"].iloc[0]
-        sample_rate = 1.0 / dt if dt > 0 else 1.0
-    if sample_rate is None:
-        sample_rate = 1.0
-
-    print(f"Estimated sample_rate = {sample_rate:.1f} Hz")
-
-    chunk_no = 0
-    # Stream vibration in chunks
-    for vib_chunk in pd.read_csv(vib_csv, usecols=["Time_s", "Vibration"], iterator=True, chunksize=chunksize):
-        chunk_no += 1
-        vib_vals = vib_chunk["Vibration"].values.astype(np.float32)
-        vib_times = vib_chunk["Time_s"].values.astype(np.float64)
-        # append to rolling buffer
-        rolling = np.concatenate((rolling, vib_vals))
-        rolling_times = np.concatenate((rolling_times, vib_times))
-
-        # produce windows while we have at least one full window
-        max_start = len(rolling) - win_size
-        start_idx = 0
-        while start_idx <= max_start:
-            window = rolling[start_idx:start_idx+win_size]
-            spec = compute_spectrogram(window, fs=sample_rate, spec_shape=spec_shape)
-            center_time = float(rolling_times[start_idx + win_size // 2])
-
-            # acoustic features (fast path if acoustic loaded)
-            if ac_loaded_in_memory and ac_times is not None:
-                ac_window_half_secs = (win_size / sample_rate) / 10.0
-                left = center_time - ac_window_half_secs
-                right = center_time + ac_window_half_secs
-                li = np.searchsorted(ac_times, left, side='left')
-                ri = np.searchsorted(ac_times, right, side='right')
-                if ri <= li:
-                    li = max(0, li-1)
-                    ri = min(li+2, len(ac_vals))
-                ac_win = ac_vals[li:ri]
-                if ac_win.size == 0:
-                    ac_feats = np.zeros((4,), dtype=np.float32)
-                else:
-                    ac_feats = np.array([np.mean(ac_win), np.std(ac_win), np.max(ac_win), np.min(ac_win)], dtype=np.float32)
-            else:
-                # acoustic not in memory - currently fallback to zeros
-                # If you want streaming acoustic, we can implement a ring-buffer similar to vibration.
-                ac_feats = np.zeros((4,), dtype=np.float32)
-
-            # TODO: Replace this placeholder with your actual label alignment logic (RUL or fault).
-            label = 0.0
-            examples_buffer.append((spec, ac_feats, label))
-
-            if len(examples_buffer) >= shardsize:
-                write_tfrecord_examples(shard_idx, examples_buffer, out_dir)
-                print(f"Wrote shard {shard_idx} with {len(examples_buffer)} examples.")
-                shard_idx += 1
-                examples_buffer = []
-
-            start_idx += step
-
-        # keep only tail needed to cross chunk boundary
-        keep = max(win_size - step, 0)
-        if keep > 0:
-            rolling = rolling[-keep:]
-            rolling_times = rolling_times[-keep:]
+    new_cols = []
+    for i, c in enumerate(df.columns):
+        s = str(c)
+        # keep Time_s if already present
+        if s.lower() == "time_s" or s.lower() == "time" or s.lower() == "time_s":
+            new_cols.append("Time_s")
+            continue
+        m = re.search(r'ai(\d+)', s)
+        if m:
+            new_cols.append(f"ai{m.group(1)}")
         else:
-            rolling = np.empty((0,), dtype=np.float32)
-            rolling_times = np.empty((0,), dtype=np.float64)
+            # fallback: short name
+            new_cols.append(f"ch{i}")
+    df.columns = new_cols
+    return df
 
-        print(f"Processed vib chunk {chunk_no}, rolling length now {len(rolling)}")
+def ensure_time_column(df: pd.DataFrame):
+    # if there's no Time_s, try to infer from index or add a sample index as Time_s
+    if "Time_s" in df.columns:
+        return df
+    # else add a Time_s using row index (assume uniform sampling)
+    df = df.copy()
+    df.insert(0, "Time_s", np.arange(len(df)))
+    return df
 
-    # flush residual examples
-    if len(examples_buffer) > 0:
-        write_tfrecord_examples(shard_idx, examples_buffer, out_dir)
-        print(f"Wrote final shard {shard_idx} with {len(examples_buffer)} examples.")
-        shard_idx += 1
-
-    print(f"Preprocessing complete. Total shards: {shard_idx}")
-
-# ----------------------------
-# TRAIN: load TFRecords with tf.data and train model (non-overlapping sequences)
-# ----------------------------
-def parse_flat(example_proto):
+# ----------------- Processing & window creation -----------------
+def process_and_save_windows(csv_path: Path, sensor_type: str, out_dir: Path,
+                             chunksize: int = 2_000_000, resample=False, target_dt=None,
+                             window_size: int = 2048, step: int = 512, save_format="npz"):
     """
-    Parse a TFRecord example into (spec, ac, label) triple.
-    spec -> tensor shape SPEC_SHAPE + (1,)
-    ac   -> tensor shape (4,)
-    label -> scalar tensor
+    Read csv in chunks, canonicalize columns if needed, create sliding windows and save them.
+    Each saved file will be: out_dir/{sensor_type}/{label}_w{window}_s{step}.npz
+    The .npz will contain arrays: windows (N, window_size, n_features), metadata dict
     """
-    feature_description = {
-        FEATURE_SPEC_KEY: tf.io.VarLenFeature(tf.float32),
-        FEATURE_AC_KEY: tf.io.VarLenFeature(tf.float32),
-        FEATURE_LABEL_KEY: tf.io.VarLenFeature(tf.float32),
+    meta = parse_filename_meta(csv_path.name)
+    label = f"{meta.get('load_Nm') or 'NA'}Nm_{meta.get('condition')}_{meta.get('severity') or 'none'}"
+    out_folder = out_dir / sensor_type
+    out_folder.mkdir(parents=True, exist_ok=True)
+    # read entire file in chunks but accumulate windows per file to keep windows contiguous
+    # For simplicity and given potential large file sizes we will stream rows and build windows using a rolling buffer
+    reader = pd.read_csv(csv_path, chunksize=chunksize, header=0)
+    buffer = None
+    windows_collected = []
+    cols_used = None
+    for chunk in reader:
+        df = chunk.copy()
+        # canonicalize current_temp columns
+        if sensor_type == "current_temp":
+            df = canonicalize_current_temp_columns(df)
+        df = ensure_time_column(df)
+        # drop any all-NaN cols
+        df = df.dropna(axis=1, how='all')
+        # choose feature columns (exclude Time_s)
+        feature_cols = [c for c in df.columns if c != "Time_s"]
+        cols_used = feature_cols if cols_used is None else cols_used
+        arr = df[feature_cols].to_numpy(dtype=float)
+        if buffer is None:
+            buffer = arr
+        else:
+            # append new chunk to buffer
+            buffer = np.vstack([buffer, arr])
+        # create windows from buffer where possible (but keep overlap)
+        start = 0
+        max_start = buffer.shape[0] - window_size
+        while max_start >= 0 and start <= max_start:
+            w = buffer[start:start+window_size]
+            windows_collected.append(w)
+            start += step
+            max_start = buffer.shape[0] - window_size
+        # keep tail part of buffer for next chunk
+        if buffer.shape[0] >= window_size:
+            buffer = buffer[start:]
+    # after reading all chunks, no more new data; windows collected ready
+    windows = np.stack(windows_collected) if len(windows_collected) > 0 else np.zeros((0, window_size, len(cols_used)), dtype=float)
+    out_name = out_folder / f"{label}_w{window_size}_s{step}.npz"
+    meta_obj = {"source_file": csv_path.name, "label": label, "load_Nm": meta.get("load_Nm"),
+                "condition": meta.get("condition"), "severity": meta.get("severity"),
+                "sensor_type": sensor_type, "cols": cols_used}
+    np.savez_compressed(out_name, windows=windows, meta=json.dumps(meta_obj))
+    print(f"Saved {windows.shape[0]} windows to {out_name}")
+    return out_name
+
+def find_and_process_all(base_dir: Path, out_dir: Path, window_size=2048, step=512, chunksize=2_000_000):
+    folders = {
+        "acoustic": base_dir / "acoustic_csv_data",
+        "vibration": base_dir / "vibration_csv_data",
+        "current_temp": base_dir / "current_temp",
     }
-    parsed = tf.io.parse_single_example(example_proto, feature_description)
-    spec_flat = tf.sparse.to_dense(parsed[FEATURE_SPEC_KEY])
-    ac_flat = tf.sparse.to_dense(parsed[FEATURE_AC_KEY])
-    label_flat = tf.sparse.to_dense(parsed[FEATURE_LABEL_KEY])
-    spec = tf.reshape(spec_flat, SPEC_SHAPE + (1,))
-    ac = tf.reshape(ac_flat, (4,))
-    label = tf.reshape(label_flat, ())
-    return spec, ac, label
+    created_files = []
+    for sensor, folder in folders.items():
+        if not folder.exists():
+            print(f"Folder {folder} not found; skipping {sensor}")
+            continue
+        for csv in sorted(folder.glob("*.csv")):
+            print("Processing:", csv)
+            npz = process_and_save_windows(csv, sensor, out_dir, chunksize=chunksize,
+                                           window_size=window_size, step=step)
+            created_files.append(npz)
+    return created_files
 
-def build_model(spec_shape=SPEC_SHAPE, ac_dim=4, seq_len=SEQ_LEN):
-    frame_h, frame_w = spec_shape
-    # CNN frame model
-    cnn_input = tf.keras.Input(shape=(frame_h, frame_w, 1), name="frame_spec")
-    x = tf.keras.layers.Conv2D(16, 3, activation='relu', padding='same')(cnn_input)
-    x = tf.keras.layers.MaxPool2D(2)(x)
-    x = tf.keras.layers.Conv2D(32, 3, activation='relu', padding='same')(x)
-    x = tf.keras.layers.MaxPool2D(2)(x)
-    x = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(x)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    cnn_out = tf.keras.layers.Dense(64, activation='relu')(x)
-    cnn_model = tf.keras.Model(cnn_input, cnn_out, name="frame_cnn")
+# ----------------- Dataset generator & label handling -----------------
+def load_npz_windows(npz_path: Path):
+    """Load windows and metadata from an .npz created by process_and_save_windows"""
+    with np.load(npz_path, allow_pickle=True) as d:
+        windows = d["windows"]
+        meta = json.loads(d["meta"].tolist())
+    return windows, meta
 
-    # Sequence inputs
-    seq_spec_input = tf.keras.Input(shape=(seq_len, frame_h, frame_w, 1), name="seq_spec")
-    seq_ac_input = tf.keras.Input(shape=(seq_len, ac_dim), name="seq_ac")
+def build_file_index(npz_paths):
+    """
+Build a pandas DataFrame indexing all windows files and labels.
+Columns: path, sensor_type, load_Nm, condition, severity, n_windows, cols
+"""
+    rows = []
+    for p in npz_paths:
+        _, meta = load_npz_windows(Path(p))
+        rows.append({
+            "path": str(p),
+            "sensor_type": meta["sensor_type"],
+            "load_Nm": meta["load_Nm"],
+            "condition": meta["condition"],
+            "severity": meta["severity"],
+            "n_windows": int(np.load(p)["windows"].shape[0]),
+            "cols": meta["cols"]
+        })
+    return pd.DataFrame(rows)
 
-    td = tf.keras.layers.TimeDistributed(cnn_model)(seq_spec_input)
-    fused = tf.keras.layers.Concatenate(axis=-1)([td, seq_ac_input])
-    fused = tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(128, activation='relu'))(fused)
-    lstm_out = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(64, return_sequences=False))(fused)
-    out = tf.keras.layers.Dense(1, activation='linear', name='rul_out')(lstm_out)
-    model = tf.keras.Model([seq_spec_input, seq_ac_input], out)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), loss='mse', metrics=['mae'])
+class WindowGenerator:
+    """
+    Generator that yields batches (X, y) by streaming windows from .npz files.
+    y_labels: user-defined mapping from ('condition','severity','load') to integer class label.
+    If y is None, generator yields X only.
+    """
+    def __init__(self, file_index_df, class_map, batch_size=32, shuffle=True, mode="classification"):
+        self.df = file_index_df.copy()
+        self.class_map = class_map
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.mode = mode  # 'classification' or 'regression'
+        # create list of (path, idx) pairs for windows
+        self.samples = []
+        for _, r in self.df.iterrows():
+            p = Path(r["path"])
+            n = int(np.load(p)["windows"].shape[0])
+            for i in range(n):
+                self.samples.append((p, i))
+        self.on_epoch_end()
+
+    def __len__(self):
+        return math.ceil(len(self.samples) / self.batch_size)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.samples)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if len(self.samples) == 0:
+            self.on_epoch_end()
+            raise StopIteration
+        batch = self.samples[:self.batch_size]
+        self.samples = self.samples[self.batch_size:]
+        Xs = []
+        ys = []
+        for p, idx in batch:
+            with np.load(p, allow_pickle=True) as d:
+                w = d["windows"][idx].astype(np.float32)
+                meta = json.loads(d["meta"].tolist())
+            Xs.append(w)
+            if self.mode == "classification":
+                key = (meta["condition"], meta["severity"], meta["load_Nm"])
+                y = self.class_map.get(f"{meta['condition']}_{meta.get('severity') or 'none'}_{meta.get('load_Nm')}", 0)
+                ys.append(y)
+            else:
+                ys.append(meta.get("load_Nm") or 0.0)
+        X = np.stack(Xs)
+        y = np.array(ys)
+        return X, y
+
+# ----------------- Simple LSTM model builder -----------------
+def build_lstm_model(input_shape, n_classes=None, embedding=False):
+    if tf is None:
+        raise RuntimeError("TensorFlow not available. Install tensorflow to train the model.")
+    model = Sequential()
+    # mask zero rows if present
+    model.add(Masking(mask_value=0.0, input_shape=input_shape))
+    model.add(Bidirectional(LSTM(128, return_sequences=False)))
+    model.add(Dropout(0.3))
+    if n_classes is None:
+        # regression
+        model.add(Dense(1, activation="linear"))
+        model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    else:
+        model.add(Dense(n_classes, activation="softmax"))
+        model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return model
 
-def train_from_tfrecords(tfrecord_dir=TFRECORD_DIR, epochs=EPOCHS, batch_size=BATCH_SIZE):
-    """
-    Train from TFRecord shards that contain *per-window* examples.
-    This builds non-overlapping sequences of length SEQ_LEN by batching windows together.
-    Output dataset elements: ((spec_seq, ac_seq), label_last).
-    """
-    files = tf.io.gfile.glob(os.path.join(tfrecord_dir, "shard-*.tfrecord"))
-    if not files:
-        raise ValueError("No TFRecord shards found in " + tfrecord_dir)
-
-    # Dataset of per-window examples
-    ds = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
-    ds = ds.map(parse_flat, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Create non-overlapping sequences of length SEQ_LEN
-    ds_seq_windows = ds.batch(SEQ_LEN, drop_remainder=True)
-
-    # Map to model inputs ((spec_seq, ac_seq), label_last)
-    def to_model_input(specs_seq, acs_seq, labels_seq):
-        label_last = labels_seq[-1]
-        return (specs_seq, acs_seq), label_last
-
-    ds_model = ds_seq_windows.map(to_model_input, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # Batch sequences into training batches
-    ds_model = ds_model.batch(batch_size, drop_remainder=True)
-    ds_model = ds_model.prefetch(tf.data.AUTOTUNE)
-
-    # Build and train model
-    model = build_model(spec_shape=SPEC_SHAPE, ac_dim=4, seq_len=SEQ_LEN)
-    model.summary()
-
+# ----------------- Training orchestration -----------------
+def train_from_npz_index(file_index_df, out_model_dir: Path, epochs=10, batch_size=32, val_split=0.2):
+    # build class map from unique condition+severity+load combinations
+    labels = []
+    for _, r in file_index_df.iterrows():
+        labels.append(f"{r['condition']}_{r['severity'] or 'none'}_{r['load_Nm']}")
+    unique = sorted(list(set(labels)))
+    class_map = {name: i for i, name in enumerate(unique)}
+    print("Classes:", class_map)
+    # create generator
+    gen = WindowGenerator(file_index_df, class_map, batch_size=batch_size, shuffle=True, mode="classification")
+    # compute input shape by loading first sample
+    sample_p, _ = gen.samples[0]
+    X0 = np.load(sample_p)["windows"][0]
+    timesteps, features = X0.shape
+    n_classes = len(unique)
+    model = build_lstm_model((timesteps, features), n_classes=n_classes)
+    out_model_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = out_model_dir / "best_model.h5"
     callbacks = [
-        tf.keras.callbacks.ModelCheckpoint("cnn_lstm_best.h5", save_best_only=True, monitor="loss"),
-        tf.keras.callbacks.EarlyStopping(monitor="loss", patience=5, restore_best_weights=True)
+        EarlyStopping(monitor="loss", patience=3, restore_best_weights=True),
+        ModelCheckpoint(str(ckpt), save_best_only=True, monitor="loss")
     ]
+    steps_per_epoch = len(gen)
+    # Note: For simplicity we will not create a separate validation generator here.
+    # Use model.fit with generator-like object by wrapping in tf.data if needed.
+    print("Training model...")
+    # convert generator to tf.data.Dataset for fit compatibility
+    def gen_fn():
+        while True:
+            for Xb, yb in WindowGenerator(file_index_df, class_map, batch_size=batch_size, shuffle=True):
+                yield Xb, yb
+    dataset = tf.data.Dataset.from_generator(gen_fn, output_types=(tf.float32, tf.int32), output_shapes=([None, timesteps, features], [None,]))
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    # Fit for a small number of steps per epoch to prevent infinite generator issues
+    model.fit(dataset, epochs=epochs, steps_per_epoch=steps_per_epoch, callbacks=callbacks)
+    print("Training complete. Model saved to", ckpt)
+    return model, class_map
 
-    model.fit(ds_model, epochs=epochs, callbacks=callbacks)
-
-# ----------------------------
-# MAIN CLI
-# ----------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["preprocess", "train"], help="Mode: preprocess or train")
-    args = parser.parse_args()
-
-    if args.mode == "preprocess":
-        print("Starting preprocessing into TFRecord shards...")
-        streaming_preprocess_to_tfrecord(VIB_PATH, AC_PATH, out_dir=TFRECORD_DIR,
-                                        chunksize=CHUNKSIZE, win_size=WIN_SIZE, step=STEP,
-                                        seq_len=SEQ_LEN, spec_shape=SPEC_SHAPE, shardsize=SHARDSIZE)
-    elif args.mode == "train":
-        print("Starting training from TFRecord shards...")
-        train_from_tfrecords(tfrecord_dir=TFRECORD_DIR, epochs=EPOCHS, batch_size=BATCH_SIZE)
-    else:
-        print("Unknown mode")
+# ----------------- CLI -----------------
+def main(args):
+    base_dir = Path(args.base_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 1) Process files -> create .npz windows for each file
+    created = find_and_process_all(base_dir, out_dir, window_size=args.window_size, step=args.step, chunksize=args.chunksize)
+    if len(created) == 0:
+        print("No npz windows created; exiting.")
+        return
+    # 2) Build index DataFrame
+    file_index = build_file_index(created)
+    idx_csv = out_dir / "file_index.csv"
+    file_index.to_csv(idx_csv, index=False)
+    print("Wrote file index to", idx_csv)
+    # 3) Train model if requested
+    if args.train:
+        if tf is None:
+            print("TensorFlow not installed; cannot train. Install tensorflow and re-run with --train")
+            return
+        model_out = Path(args.model_out_dir)
+        model, class_map = train_from_npz_index(file_index, model_out, epochs=args.epochs, batch_size=args.batch_size)
+        # save class map for inference
+        with open(model_out / "class_map.json", "w") as f:
+            json.dump(class_map, f)
+        print("Saved class map to", model_out / "class_map.json")
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser(description="Prepare windows from CSVs and train LSTM.")
+    p.add_argument("--base_dir", type=str, default="./", help="Base dir containing folders acoustic_csv_data, vibration_csv_data, current_temp (default ./)")
+    p.add_argument("--out_dir", type=str, default="./processed_data", help="Where to save .npz windows and index (default ./processed_data)")
+    p.add_argument("--window_size", type=int, default=2048, help="Window size in samples (default 2048)")
+    p.add_argument("--step", type=int, default=512, help="Step size between windows (default 512)")
+    p.add_argument("--chunksize", type=int, default=2000000, help="CSV read chunksize (default 2,000,000)")
+    p.add_argument("--make_windows", action="store_true", help="Create windows (default False)")
+    p.add_argument("--train", action="store_true", help="Train LSTM after creating windows (default False)")
+    p.add_argument("--epochs", type=int, default=10, help="Training epochs (default 10)")
+    p.add_argument("--batch_size", type=int, default=32, help="Training batch size (default 32)")
+    p.add_argument("--model_out_dir", type=str, default="./model_out", help="Where to save trained model (default ./model_out)")
+    args = p.parse_args()
+
+    # If user asked to make windows or train, run main; otherwise just print config
+    print("Configuration:")
+    for k, v in vars(args).items():
+        print(f"{k}: {v}")
+    if args.make_windows or args.train:
+        main(args)
+    else:
+        print("No action requested. Use --make_windows to create windows and --train to train the model.")
