@@ -6,3 +6,5 @@
 6. this will create acoustic csv data in acoustic/ and vibration csv data in vibration/ and csv_exports in current,temp
 7. rename csv_exports to current_temp and put it in root dir (same dir as acoustic/ and vibration/)
 8. python train_lstm.py
+9. python train_cnn.py
+10. (optional) python test_model.py
