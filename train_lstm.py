@@ -1,373 +1,420 @@
 #!/usr/bin/env python3
 """
-train_multimodal_lstm_forecast.py
+ts_forecast_from_scalograms_fast.py
 
-Train a multimodal LSTM that forecasts FUTURE_SECS of all modalities (acoustic, vibration, current)
-so those predicted signals can later be passed to the CNN classifier.
+Fast comparative forecasting from saved scalograms (.npy in scalograms/<modality>/).
 
-Outputs:
- - models/multimodal_lstm_forecast_final.h5
- - models/multimodal_lstm_forecast_artifacts.joblib
+- Balanced sampling: exactly K files per CONDITION
+- Early thinning: optional frequency crop + cap time columns + stride-decimate columns
+- PCA over frequency bins (fit on train-only), target = PC1
+- Windows: X (seq_len × N_FEAT), y (horizon)
+- Models: Naive, ARIMA (single-fit fast), LSTM, GRU, CNN-LSTM
+- Prints a clear "[INFO] Starting neural model training..." line before NN training begins
 
-Requirements:
- pip install pandas numpy scipy scikit-learn tensorflow joblib
+Run:
+  python ts_forecast_from_scalograms_fast.py
 """
-import os, glob, math, random, joblib
+
+import os, glob
+from pathlib import Path
+from typing import List, Tuple
 import numpy as np
-import pandas as pd
-from scipy import interpolate
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.tsa.arima.model import ARIMA
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-# ------------- CONFIG -------------
-ACOUSTIC_DIR = "acoustic"
-VIBRATION_DIR = "vibration"
-CURRENT_DIR = "current_temp"
-MODELS_DIR = "models"
-os.makedirs(MODELS_DIR, exist_ok=True)
+# ==================== KNOBS (speed/size) ====================
+SCALOGRAM_ROOT = "scalograms"
+MODALITIES = ["acoustic", "vibration"]
 
-TARGET_FS = 100.0      # Hz (lower if memory/CPU issues)
-WINDOW_SECS = 2.0      # input window length (seconds)
-FUTURE_SECS = 2.0      # how far in future to predict (seconds) — we predict same length as input
-SEQ_LEN = int(TARGET_FS * WINDOW_SECS)
-HORIZON = int(TARGET_FS * FUTURE_SECS)   # number of future timesteps predicted
-STEP = SEQ_LEN // 2
+# Balanced sampling
+FILES_PER_CONDITION = 4      # exactly this many per condition
 
-AC_CH, VB_CH, CT_CH = 1, 4, 5
-TOTAL_OUT_CH = AC_CH + VB_CH + CT_CH   # total channels predicted per timestep
+# Time axis throttling
+MAX_TIME_COLS_PER_FILE = 20000   # cap T per file (None = keep full)
+COL_STRIDE = 8                   # keep every Nth column (>=1)
 
-MAX_WINDOWS_PER_EXP = 300
-MAX_WINDOWS_TOTAL = 20000
+# Frequency throttling (rows)
+FREQ_SLICE = (None, 128)         # (start, end) on freq axis; (None, None) keeps all
 
-BATCH_SIZE = 32
-EPOCHS = 40
-TEST_SIZE = 0.2
-RANDOM_STATE = 42
+# PCA features from frequency axis
+N_FEAT = 8
+EPS = 1e-12
 
-TIME_COL = "Time Stamp"
+# Supervised framing
+SEQ_LEN  = 64
+HORIZON  = 8
+STEP     = 8
 
-np.random.seed(RANDOM_STATE)
-random.seed(RANDOM_STATE)
-tf.random.set_seed(RANDOM_STATE)
+# Splits (chronological by time)
+TRAIN_FRAC = 0.70
+VAL_FRAC   = 0.15  # rest = test
 
-# ------------- helpers -------------
-def basename_noext(p): return os.path.splitext(os.path.basename(p))[0]
+# Deep training
+EPOCHS       = 8
+BATCH_SIZE   = 128
+LR           = 1e-3
+HIDDEN_SIZE  = 64
+NUM_LAYERS   = 1
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
-def read_csv_signal(path, expected_channels=None, nrows=None):
-    df = pd.read_csv(path, nrows=nrows)
-    if TIME_COL not in df.columns:
-        raise ValueError(f"No '{TIME_COL}' in {path}")
-    t = df[TIME_COL].to_numpy(dtype=float)
-    meta_cols = [c for c in ("load","condition","severity") if c in df.columns]
-    data_cols = [c for c in df.columns if c not in ([TIME_COL] + meta_cols)]
-    x = df[data_cols].to_numpy(dtype=float)
-    if expected_channels is not None:
-        if x.shape[1] < expected_channels:
-            pad = np.full((x.shape[0], expected_channels - x.shape[1]), np.nan)
-            x = np.concatenate([x, pad], axis=1)
+# Repro & threading
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if DEVICE == "cuda":
+    torch.cuda.manual_seed_all(SEED)
+torch.set_num_threads(max(1, os.cpu_count() // 2))
+
+# ==================== HELPERS ====================
+def _parse_condition_from_fname(npy_path: str) -> str:
+    """
+    Expect names like: <load>_<condition>_<severity>__... e.g. 0Nm_BPFI_03__values__win00010.npy
+    Also fixes 'Unbalalnce' -> 'Unbalance'.
+    """
+    stem = Path(npy_path).stem
+    main = stem.split("__")[0]  # "0Nm_BPFI_03"
+    parts = main.split("_")
+    cond = parts[1] if len(parts) >= 2 else "UNKNOWN"
+    return "Unbalance" if cond.lower() == "unbalalnce" else cond
+
+def scan_balanced_per_condition(modality: str, k_per_cond: int) -> List[str]:
+    """
+    Return up to k_per_cond scalogram files per condition for a given modality.
+    """
+    folder = os.path.join(SCALOGRAM_ROOT, modality)
+    all_paths = sorted(glob.glob(os.path.join(folder, "*.npy")))
+    if not all_paths:
+        return []
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for p in all_paths:
+        cond = _parse_condition_from_fname(p)
+        groups[cond].append(p)
+    rng = np.random.default_rng(SEED)
+    selected = []
+    for cond, paths in groups.items():
+        rng.shuffle(paths)
+        selected.extend(paths[:k_per_cond])
+    rng.shuffle(selected)
+    return selected
+
+def load_power(path: str) -> np.ndarray:
+    arr = np.load(path, allow_pickle=False)
+    if arr.ndim != 2:
+        raise ValueError(f"Scalogram must be 2D (F,T): {path}")
+    return arr.astype(np.float32)
+
+def normalize_log(power: np.ndarray) -> np.ndarray:
+    X = np.log10(power + EPS).astype(np.float32)
+    mn, mx = X.min(), X.max()
+    if mx > mn:
+        X = (X - mn) / (mx - mn)
+    else:
+        X.fill(0.0)
+    return X
+
+def concat_time_matrix(paths: List[str]) -> np.ndarray:
+    """
+    Load multiple scalograms (F,T), apply freq crop, time cap, time stride, normalize,
+    and concatenate along time axis -> (F, sumT).
+    """
+    chunks = []
+    fs, fe = FREQ_SLICE
+    for p in paths:
+        try:
+            P = load_power(p)  # (F,T)
+            if fs is not None or fe is not None:
+                P = P[slice(fs, fe), :]
+            if MAX_TIME_COLS_PER_FILE and P.shape[1] > MAX_TIME_COLS_PER_FILE:
+                P = P[:, :MAX_TIME_COLS_PER_FILE]
+            if COL_STRIDE and COL_STRIDE > 1:
+                P = P[:, ::COL_STRIDE]
+            P = normalize_log(P)
+            chunks.append(P)
+        except Exception as e:
+            print(f"[WARN] skip {Path(p).name}: {e}")
+    if not chunks:
+        raise RuntimeError("No valid scalograms loaded.")
+    F = chunks[0].shape[0]
+    for c in chunks:
+        if c.shape[0] != F:
+            raise ValueError("Inconsistent frequency-bin count across files. Ensure consistent generation settings.")
+    return np.concatenate(chunks, axis=1)
+
+def chrono_split_time(P: np.ndarray):
+    """
+    Split P (F,T) chronologically by time axis into train/val/test.
+    """
+    T = P.shape[1]
+    n_train = int(T * TRAIN_FRAC)
+    n_val   = int(T * (TRAIN_FRAC + VAL_FRAC))
+    return P[:, :n_train], P[:, n_train:n_val], P[:, n_val:], n_train, n_val, T - n_val
+
+def build_supervised(X_feat: np.ndarray, y_uni: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    X_feat: (T, N_FEAT)
+    y_uni:  (T,)
+    Returns:
+      X: (N, SEQ_LEN, N_FEAT)
+      y: (N, HORIZON)
+    """
+    N = X_feat.shape[0]
+    Xs, Ys = [], []
+    end = N - (SEQ_LEN + HORIZON) + 1
+    for i in range(0, max(0, end), STEP):
+        Xs.append(X_feat[i:i+SEQ_LEN, :])
+        Ys.append(y_uni[i+SEQ_LEN:i+SEQ_LEN+HORIZON])
+    if not Xs:
+        return np.zeros((0, SEQ_LEN, X_feat.shape[1]), np.float32), np.zeros((0, HORIZON), np.float32)
+    return np.stack(Xs).astype(np.float32), np.stack(Ys).astype(np.float32)
+
+def rmse(a, b): return float(np.sqrt(mean_squared_error(a, b)))
+def mae(a, b):  return float(mean_absolute_error(a, b))
+def mape(a, b):
+    denom = np.maximum(np.abs(a), 1e-8)
+    return float(np.mean(np.abs((a - b)/denom)))*100.0
+
+# ==================== DATASETS ====================
+class SeqDataset(Dataset):
+    def __init__(self, X, y): self.X, self.y = X, y
+    def __len__(self): return len(self.X)
+    def __getitem__(self, i):
+        return torch.from_numpy(self.X[i]), torch.from_numpy(self.y[i])
+
+# ==================== MODELS ====================
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size, hidden=64, layers=1, horizon=1):
+        super().__init__()
+        self.rnn = nn.LSTM(input_size, hidden, num_layers=layers, batch_first=True)
+        self.head = nn.Linear(hidden, horizon)
+    def forward(self, x):
+        out, _ = self.rnn(x)    # (B,T,H)
+        return self.head(out[:, -1, :])
+
+class GRUForecaster(nn.Module):
+    def __init__(self, input_size, hidden=64, layers=1, horizon=1):
+        super().__init__()
+        self.rnn = nn.GRU(input_size, hidden, num_layers=layers, batch_first=True)
+        self.head = nn.Linear(hidden, horizon)
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        return self.head(out[:, -1, :])
+
+class CNNLSTMForecaster(nn.Module):
+    def __init__(self, input_size, hidden=64, layers=1, horizon=1,
+                 conv_channels=64, kernel_size=5, dropout=0.1):
+        super().__init__()
+        pad = kernel_size // 2
+        self.conv = nn.Conv1d(input_size, conv_channels, kernel_size, padding=pad)
+        self.bn   = nn.BatchNorm1d(conv_channels)
+        self.act  = nn.ReLU()
+        self.do   = nn.Dropout(dropout)
+        self.rnn  = nn.LSTM(conv_channels, hidden, num_layers=layers, batch_first=True)
+        self.head = nn.Linear(hidden, horizon)
+    def forward(self, x):
+        x = x.transpose(1, 2)           # (B,F,T)
+        x = self.do(self.act(self.bn(self.conv(x))))
+        x = x.transpose(1, 2)           # (B,T,Cc)
+        out, _ = self.rnn(x)
+        return self.head(out[:, -1, :])
+
+# ==================== TRAIN / INFER ====================
+def train_model(model, dl_tr, dl_va, epochs=8, lr=1e-3, device="cpu"):
+    model = model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    crit = nn.MSELoss()
+    best = None; best_val = float("inf"); patience=3; wait=0
+    for ep in range(1, epochs+1):
+        model.train(); run=0.0; n=0
+        for xb, yb in dl_tr:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(); pred = model(xb)
+            loss = crit(pred, yb); loss.backward(); opt.step()
+            run += loss.item()*xb.size(0); n += xb.size(0)
+        tr = run/max(1,n)
+
+        model.eval(); run=0.0; n=0
+        with torch.no_grad():
+            for xb, yb in dl_va:
+                xb, yb = xb.to(device), yb.to(device)
+                pred = model(xb); loss = crit(pred, yb)
+                run += loss.item()*xb.size(0); n += xb.size(0)
+        va = run/max(1,n)
+        print(f"[{model.__class__.__name__}] ep {ep:02d}  train={tr:.5f}  val={va:.5f}")
+
+        if va < best_val - 1e-6:
+            best_val = va; best = {k:v.cpu().clone() for k,v in model.state_dict().items()}; wait=0
         else:
-            x = x[:, :expected_channels]
-    return t, x, df
+            wait += 1
+            if wait >= patience:
+                print("  early stop"); break
+    if best is not None: model.load_state_dict(best)
+    return model
 
-def resample_to_fs(t, x, target_fs, start=None, stop=None):
-    if start is None: start = t[0]
-    if stop is None: stop = t[-1]
-    dt = 1.0 / target_fs
-    if stop <= start:
-        return np.array([]), np.zeros((0, x.shape[1]), dtype=float)
-    t_new = np.arange(start, stop, dt)
-    if t_new.size == 0:
-        return np.array([]), np.zeros((0, x.shape[1]), dtype=float)
-    x_clean = x.copy()
-    for ch in range(x_clean.shape[1]):
-        col = x_clean[:, ch].astype(float)
-        mask = np.isnan(col)
-        if np.all(mask):
-            col[:] = 0.0
+def infer_model(model, X, device="cpu"):
+    model.eval(); outs=[]
+    with torch.no_grad():
+        for i in range(0, len(X), 1024):
+            xb = torch.from_numpy(X[i:i+1024]).to(device)
+            outs.append(model(xb).cpu().numpy())
+    return np.vstack(outs) if outs else np.zeros((0, X.shape[1]))
+
+def naive_forecast(Xte, horizon):
+    last_pc1 = Xte[:, -1, 0:1]
+    return np.repeat(last_pc1, horizon, axis=1)
+
+# ==================== FAST ARIMA (single fit) ====================
+def arima_single_fit_forecasts(y_train: np.ndarray, len_val: int, len_test: int, total_extra: int) -> np.ndarray:
+    """
+    Fit ARIMA ONCE to y_train and forecast a long sequence:
+      length = len_val + len_test + total_extra
+    Returns array of that length. We will slice windows' horizons out of this vector.
+    """
+    order_candidates = [(1,0,0), (1,1,0), (2,0,0), (2,1,0)]
+    best_fit = None; best_aic = float("inf")
+    for order in order_candidates:
+        try:
+            r = ARIMA(y_train, order=order).fit(method_kwargs={"warn_convergence": False})
+            if r.aic < best_aic:
+                best_aic = r.aic; best_fit = r
+        except Exception:
+            continue
+    if best_fit is None:
+        best_fit = ARIMA(y_train, order=(1,0,0)).fit(method_kwargs={"warn_convergence": False})
+
+    steps = len_val + len_test + total_extra
+    long_fcst = best_fit.forecast(steps=steps)  # from end of train
+    return np.asarray(long_fcst, dtype=np.float32)
+
+def arima_slice_windows_from_long_fcst(long_fcst: np.ndarray, len_val: int, seq_len: int, horizon: int, n_test_windows: int) -> np.ndarray:
+    """
+    Map the precomputed long forecast to each test window's horizon:
+      For test window i (0-indexed), the horizon starts at: offset = len_val + seq_len + i
+    """
+    preds = np.zeros((n_test_windows, horizon), dtype=np.float32)
+    for i in range(n_test_windows):
+        start = len_val + seq_len + i
+        end   = start + horizon
+        if end <= len(long_fcst):
+            preds[i, :] = long_fcst[start:end]
         else:
-            if np.any(mask):
-                idx = np.arange(len(col)); good = idx[~mask]; vals = col[~mask]
-                col[:good[0]] = vals[0]; col[good[-1]+1:] = vals[-1]
-                col[mask] = np.interp(idx[mask], good, vals)
-        x_clean[:, ch] = col
-    x_new = np.zeros((len(t_new), x_clean.shape[1]), dtype=float)
-    for ch in range(x_clean.shape[1]):
-        f = interpolate.interp1d(t, x_clean[:, ch], kind='linear', bounds_error=False, fill_value="extrapolate")
-        x_new[:, ch] = f(t_new)
-    return t_new, x_new
+            # pad by repeating last element if forecast too short
+            tail = long_fcst[start:] if start < len(long_fcst) else np.array([long_fcst[-1]], dtype=np.float32)
+            fill = np.full(horizon - len(tail), tail[-1], dtype=np.float32)
+            preds[i, :] = np.concatenate([tail, fill])
+    return preds
 
-def windows_and_future_from_resampled(x_res, seq_len=SEQ_LEN, step=STEP, horizon=HORIZON):
-    # returns X_windows shape (n, seq_len, ch), Y_futures shape (n, horizon, ch)
-    N = x_res.shape[0]
-    Xw, Yw = [], []
-    for s in range(0, N - seq_len - horizon + 1, step):
-        Xw.append(x_res[s:s+seq_len, :])
-        Yw.append(x_res[s+seq_len:s+seq_len+horizon, :])
-    if len(Xw) == 0:
-        return np.zeros((0, seq_len, x_res.shape[1]), dtype=np.float32), np.zeros((0, horizon, x_res.shape[1]), dtype=np.float32)
-    return np.array(Xw, dtype=np.float32), np.array(Yw, dtype=np.float32)
+# ==================== CORE PIPELINE ====================
+def run_modality(modality: str):
+    print(f"\n=== {modality.upper()} from scalograms ===")
+    paths = scan_balanced_per_condition(modality, FILES_PER_CONDITION)
+    if not paths:
+        print(f"[WARN] no scalograms in {SCALOGRAM_ROOT}/{modality}")
+        return
 
-# ------------- build file maps -------------
-ac_files = {basename_noext(p): p for p in glob.glob(os.path.join(ACOUSTIC_DIR, "*.csv"))}
-vb_files = {basename_noext(p): p for p in glob.glob(os.path.join(VIBRATION_DIR, "*.csv"))}
-ct_files = {basename_noext(p): p for p in glob.glob(os.path.join(CURRENT_DIR, "*.csv"))}
-all_ids = sorted(list(set(list(ac_files.keys()) + list(vb_files.keys()) + list(ct_files.keys()))))
-print("Found experiments:", len(all_ids))
+    # Build (F,T) after early thinning
+    P = concat_time_matrix(paths)          # (F, T_total)
+    F, T = P.shape
+    print(f"Loaded {len(paths)} files -> matrix {F}×{T} (F×T)")
 
-# ------------- collect windows (allow missing modalities) -------------
-Xac, Xvb, Xct, masks, Yfutures, exp_ids = [], [], [], [], [], []
+    # Chrono split on time
+    Ptr, Pva, Pte, ntr, nva, nte = chrono_split_time(P)
 
-def pad_repeat(Xw, desired, ch):
-    if Xw.shape[0] == 0:
-        return np.zeros((desired, SEQ_LEN, ch), dtype=np.float32)
-    if Xw.shape[0] >= desired:
-        return Xw[:desired]
-    last = Xw[-1]
-    pads = np.stack([last] * (desired - Xw.shape[0]), axis=0)
-    return np.concatenate([Xw, pads], axis=0)
+    # PCA on train-only (freq->features per time-slice)
+    pca = PCA(n_components=min(N_FEAT, F), random_state=SEED)
+    pca.fit(Ptr.T)
 
-for eid in all_ids:
-    ac_path = ac_files.get(eid)
-    vb_path = vb_files.get(eid)
-    ct_path = ct_files.get(eid)
+    Xtr = pca.transform(Ptr.T).astype(np.float32)
+    Xva = pca.transform(Pva.T).astype(np.float32)
+    Xte = pca.transform(Pte.T).astype(np.float32)
 
-    # find overlap (or union)
-    starts, stops = [], []
-    try:
-        if ac_path:
-            t_ac, _, _ = read_csv_signal(ac_path, expected_channels=AC_CH)
-            starts.append(t_ac[0]); stops.append(t_ac[-1])
-    except: pass
-    try:
-        if vb_path:
-            t_vb, _, _ = read_csv_signal(vb_path, expected_channels=VB_CH)
-            starts.append(t_vb[0]); stops.append(t_vb[-1])
-    except: pass
-    try:
-        if ct_path:
-            t_ct, _, _ = read_csv_signal(ct_path, expected_channels=CT_CH)
-            starts.append(t_ct[0]); stops.append(t_ct[-1])
-    except: pass
+    # Target = PC1
+    ytr = Xtr[:, 0]
+    yva = Xva[:, 0]
+    yte = Xte[:, 0]
 
-    if len(starts) == 0:
-        continue
+    # Supervised windows
+    Xtr_w, Ytr_w = build_supervised(Xtr, ytr)
+    Xva_w, Yva_w = build_supervised(Xva, yva)
+    Xte_w, Yte_w = build_supervised(Xte, yte)
+    print(f"Windows -> train={len(Xtr_w)}  val={len(Xva_w)}  test={len(Xte_w)}")
 
-    start = max(starts)
-    stop = min(stops) if len(stops) > 0 else max(stops)
-    if stop <= start + 1e-9:
-        # fallback to union
-        start = min(starts); stop = max(stops)
-    if stop - start < (WINDOW_SECS + FUTURE_SECS):
-        # not enough room to form input+future
-        continue
+    if len(Xte_w) == 0:
+        print("Not enough test windows. Reduce SEQ_LEN/HORIZON or relax caps.")
+        return
 
-    # resample present modalities
-    ac_r = vb_r = ct_r = None
-    try:
-        if ac_path:
-            _, ac_r = resample_to_fs(*read_csv_signal(ac_path, expected_channels=AC_CH)[:2], TARGET_FS, start, stop)
-        if vb_path:
-            _, vb_r = resample_to_fs(*read_csv_signal(vb_path, expected_channels=VB_CH)[:2], TARGET_FS, start, stop)
-        if ct_path:
-            _, ct_r = resample_to_fs(*read_csv_signal(ct_path, expected_channels=CT_CH)[:2], TARGET_FS, start, stop)
-    except Exception:
-        continue
+    results = []
 
-    # choose minimum length among present ones and trim
-    lens = [arr.shape[0] for arr in (ac_r, vb_r, ct_r) if arr is not None]
-    if len(lens) == 0: continue
-    n = min(lens)
-    if n < SEQ_LEN + HORIZON:
-        continue
-    if ac_r is not None: ac_r = ac_r[:n]
-    if vb_r is not None: vb_r = vb_r[:n]
-    if ct_r is not None: ct_r = ct_r[:n]
+    # Naive baseline
+    yhat_naive = naive_forecast(Xte_w, HORIZON)
+    results.append(("Naive", yhat_naive))
 
-    # windows for each modality
-    Xac_w, Yac_w = (windows_and_future_from_resampled(ac_r, SEQ_LEN, STEP, HORIZON) if ac_r is not None else (np.zeros((0,SEQ_LEN,AC_CH),dtype=np.float32), np.zeros((0,HORIZON,AC_CH))))
-    Xvb_w, Yvb_w = (windows_and_future_from_resampled(vb_r, SEQ_LEN, STEP, HORIZON) if vb_r is not None else (np.zeros((0,SEQ_LEN,VB_CH),dtype=np.float32), np.zeros((0,HORIZON,VB_CH))))
-    Xct_w, Yct_w = (windows_and_future_from_resampled(ct_r, SEQ_LEN, STEP, HORIZON) if ct_r is not None else (np.zeros((0,SEQ_LEN,CT_CH),dtype=np.float32), np.zeros((0,HORIZON,CT_CH))))
+    # ---------- ARIMA (single-fit, fast) ----------
+    # Fit once on ytr, forecast over (len(yva) + len(yte) + seq_len + horizon),
+    # then slice horizons per test window.
+    long_fcst = arima_single_fit_forecasts(ytr, len(yva), len(yte), total_extra=SEQ_LEN + HORIZON)
+    yhat_arima = arima_slice_windows_from_long_fcst(long_fcst, len(yva), SEQ_LEN, HORIZON, n_test_windows=len(Xte_w))
+    results.append(("ARIMA(single-fit)", yhat_arima))
 
-    # number of windows to use
-    nwin = max(Xac_w.shape[0], Xvb_w.shape[0], Xct_w.shape[0])
-    if nwin == 0: continue
-    nwin = min(nwin, MAX_WINDOWS_PER_EXP)
+    # ---------- Neural nets ----------
+    print("[INFO] Starting neural model training (LSTM/GRU/CNN-LSTM)...")  # <- requested print
 
-    Xac_w = pad_repeat(Xac_w, nwin, AC_CH)
-    Xvb_w = pad_repeat(Xvb_w, nwin, VB_CH)
-    Xct_w = pad_repeat(Xct_w, nwin, CT_CH)
+    dl_tr = DataLoader(SeqDataset(Xtr_w, Ytr_w), batch_size=BATCH_SIZE, shuffle=True)
+    dl_va = DataLoader(SeqDataset(Xva_w, Yva_w), batch_size=BATCH_SIZE, shuffle=False)
 
-    # targets: ensure shape (nwin, HORIZON, ch)
-    def pad_future(Yw, desired, ch):
-        if Yw.shape[0] == 0:
-            return np.zeros((desired, HORIZON, ch), dtype=np.float32)
-        if Yw.shape[0] >= desired:
-            return Yw[:desired]
-        last = Yw[-1]
-        pads = np.stack([last] * (desired - Yw.shape[0]), axis=0)
-        return np.concatenate([Yw, pads], axis=0)
+    # LSTM
+    lstm = LSTMForecaster(Xtr_w.shape[2], HIDDEN_SIZE, NUM_LAYERS, HORIZON)
+    lstm = train_model(lstm, dl_tr, dl_va, EPOCHS, LR, DEVICE)
+    yhat_lstm = infer_model(lstm, Xte_w, DEVICE)
+    results.append(("LSTM", yhat_lstm))
 
-    Yac_w = pad_future(Yac_w, nwin, AC_CH)
-    Yvb_w = pad_future(Yvb_w, nwin, VB_CH)
-    Yct_w = pad_future(Yct_w, nwin, CT_CH)
+    # GRU
+    gru = GRUForecaster(Xtr_w.shape[2], HIDDEN_SIZE, NUM_LAYERS, HORIZON)
+    gru = train_model(gru, dl_tr, dl_va, EPOCHS, LR, DEVICE)
+    yhat_gru = infer_model(gru, Xte_w, DEVICE)
+    results.append(("GRU", yhat_gru))
 
-    # append to global lists
-    mask = np.array([1.0 if ac_path else 0.0, 1.0 if vb_path else 0.0, 1.0 if ct_path else 0.0], dtype=np.float32)
-    for i in range(nwin):
-        Xac.append(Xac_w[i])
-        Xvb.append(Xvb_w[i])
-        Xct.append(Xct_w[i])
-        # Yfutures combined channels (horizon, total_ch)
-        Yfutures.append(np.concatenate([Yac_w[i], Yvb_w[i], Yct_w[i]], axis=1))  # axis=1 concat channels per timestep
-        masks.append(mask)
-        exp_ids.append(eid)
+    # CNN-LSTM
+    cnnlstm = CNNLSTMForecaster(Xtr_w.shape[2], HIDDEN_SIZE, NUM_LAYERS, HORIZON,
+                                conv_channels=HIDDEN_SIZE, kernel_size=5, dropout=0.1)
+    cnnlstm = train_model(cnnlstm, dl_tr, dl_va, EPOCHS, LR, DEVICE)
+    yhat_cnnlstm = infer_model(cnnlstm, Xte_w, DEVICE)
+    results.append(("CNN-LSTM", yhat_cnnlstm))
 
-    if len(Xac) >= MAX_WINDOWS_TOTAL:
-        break
+    # ---------- Evaluate ----------
+    def eval_preds(name, pred, Y):
+        y_true_flat = Y.reshape(-1); y_pred_flat = pred.reshape(-1)
+        print(f"  {name:>15s} | H1  RMSE={rmse(Y[:,0], pred[:,0]):.4f}  MAE={mae(Y[:,0], pred[:,0]):.4f}  MAPE={mape(Y[:,0], pred[:,0]):.2f}%"
+              f"   | ALL  RMSE={rmse(y_true_flat, y_pred_flat):.4f}  MAE={mae(y_true_flat, y_pred_flat):.4f}  MAPE={mape(y_true_flat, y_pred_flat):.2f}%")
 
-# convert to numpy arrays
-total = len(Xac)
-if total == 0:
-    raise SystemExit("No training windows collected. Adjust parameters or check files.")
+    print("\nTEST performance (target=PC1):")
+    for name, pred in results:
+        eval_preds(name, pred, Yte_w)
 
-if total > MAX_WINDOWS_TOTAL:
-    sel = np.random.choice(total, size=MAX_WINDOWS_TOTAL, replace=False)
-    Xac = [Xac[i] for i in sel]; Xvb=[Xvb[i] for i in sel]; Xct=[Xct[i] for i in sel]; Yfutures=[Yfutures[i] for i in sel]; masks=[masks[i] for i in sel]
+    # ---------- Plot one test example ----------
+    idx = len(Xte_w)//2
+    t_base = np.arange(SEQ_LEN); t_fut = np.arange(SEQ_LEN, SEQ_LEN+HORIZON)
+    plt.figure(figsize=(9,4), dpi=130)
+    plt.plot(t_base, Xte_w[idx,:,0], label="PC1 input")
+    plt.plot(t_fut,  Yte_w[idx],     label="true PC1 future", linewidth=2)
+    for name, pred in results:
+        plt.plot(t_fut, pred[idx], '--', label=name)
+    plt.title(f"{modality} | one test example")
+    plt.xlabel("Time steps (columns)")
+    plt.legend(ncol=3); plt.tight_layout(); plt.show()
 
-Xac = np.array(Xac, dtype=np.float32)
-Xvb = np.array(Xvb, dtype=np.float32)
-Xct = np.array(Xct, dtype=np.float32)
-Yfutures = np.array(Yfutures, dtype=np.float32)    # shape (N, HORIZON, TOTAL_OUT_CH)
-masks = np.array(masks, dtype=np.float32)
-exp_ids = np.array(exp_ids)
+# ==================== MAIN ====================
+def main():
+    for mod in MODALITIES:
+        try:
+            run_modality(mod)
+        except Exception as e:
+            print(f"[WARN] Skipping {mod}: {e}")
 
-print("Collected:", Xac.shape, Xvb.shape, Xct.shape, Yfutures.shape, masks.shape)
-
-# ------------- split train/val by experiment (avoid leakage) -------------
-unique_exps = sorted(list(set(exp_ids)))
-train_exps, val_exps = train_test_split(unique_exps, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-train_mask = np.isin(exp_ids, train_exps)
-val_mask = np.isin(exp_ids, val_exps)
-
-Xac_tr, Xvb_tr, Xct_tr = Xac[train_mask], Xvb[train_mask], Xct[train_mask]
-masks_tr = masks[train_mask]
-Y_tr = Yfutures[train_mask]
-
-Xac_val, Xvb_val, Xct_val = Xac[val_mask], Xvb[val_mask], Xct[val_mask]
-masks_val = masks[val_mask]
-Y_val = Yfutures[val_mask]
-
-print("Train windows:", Xac_tr.shape[0], "Val windows:", Xac_val.shape[0])
-
-# ------------- per-modality scaling (fit on training inputs) -------------
-from sklearn.preprocessing import StandardScaler
-def fit_scaler_and_transform(X):
-    ns, sl, ch = X.shape
-    flat = X.reshape(-1, ch)
-    scaler = StandardScaler().fit(flat)
-    Xs = scaler.transform(flat).astype(np.float32).reshape(ns, sl, ch)
-    return scaler, Xs
-
-sc_ac, Xac_tr_s = fit_scaler_and_transform(Xac_tr)
-sc_vb, Xvb_tr_s = fit_scaler_and_transform(Xvb_tr)
-sc_ct, Xct_tr_s = fit_scaler_and_transform(Xct_tr)
-
-def apply_scaler(scaler, X):
-    ns, sl, ch = X.shape
-    return scaler.transform(X.reshape(-1, ch)).astype(np.float32).reshape(ns, sl, ch)
-
-Xac_val_s = apply_scaler(sc_ac, Xac_val)
-Xvb_val_s = apply_scaler(sc_vb, Xvb_val)
-Xct_val_s = apply_scaler(sc_ct, Xct_val)
-
-# Scale targets per-output-channel (fit on training targets)
-ns, horizon, totch = Y_tr.shape
-Y_flat = Y_tr.reshape(-1, totch)
-sc_y = StandardScaler().fit(Y_flat)
-Y_tr_s = sc_y.transform(Y_flat).reshape(ns, horizon, totch).astype(np.float32)
-Y_val_s = sc_y.transform(Y_val.reshape(-1, totch)).reshape(Y_val.shape).astype(np.float32)
-
-# ------------- build model (branches -> fusion -> dense -> reshape horizon x channels) -------------
-def lstm_branch(seq_len, nch, name):
-    inp = layers.Input(shape=(seq_len, nch))
-    x = layers.LSTM(128, return_sequences=True)(inp)
-    x = layers.LSTM(64)(x)
-    x = layers.Dense(64, activation="relu")(x)
-    return models.Model(inp, x, name=name)
-
-ac_branch = lstm_branch(SEQ_LEN, AC_CH, "ac_branch")
-vb_branch = lstm_branch(SEQ_LEN, VB_CH, "vb_branch")
-ct_branch = lstm_branch(SEQ_LEN, CT_CH, "ct_branch")
-
-ac_in = layers.Input(shape=(SEQ_LEN, AC_CH), name="acoustic_input")
-vb_in = layers.Input(shape=(SEQ_LEN, VB_CH), name="vibration_input")
-ct_in = layers.Input(shape=(SEQ_LEN, CT_CH), name="current_input")
-mask_in = layers.Input(shape=(3,), name="mask_input")
-
-ac_feat = ac_branch(ac_in)
-vb_feat = vb_branch(vb_in)
-ct_feat = ct_branch(ct_in)
-
-# small custom mask extractor
-class MaskScalarLayer(layers.Layer):
-    def __init__(self, index, **kwargs):
-        super().__init__(**kwargs)
-        self.index = int(index)
-    def call(self, x):
-        return tf.expand_dims(x[:, self.index], axis=1)
-    def get_config(self):
-        cfg = super().get_config(); cfg.update({"index": self.index}); return cfg
-
-ms0 = MaskScalarLayer(0)(mask_in)
-ms1 = MaskScalarLayer(1)(mask_in)
-ms2 = MaskScalarLayer(2)(mask_in)
-
-ac_feat = layers.Multiply()([ac_feat, ms0])
-vb_feat = layers.Multiply()([vb_feat, ms1])
-ct_feat = layers.Multiply()([ct_feat, ms2])
-
-fusion = layers.Concatenate()([ac_feat, vb_feat, ct_feat, mask_in])
-x = layers.Dense(512, activation="relu")(fusion)
-x = layers.Dropout(0.3)(x)
-x = layers.Dense(256, activation="relu")(x)
-# predict flattened horizon * channels
-out_units = HORIZON * TOTAL_OUT_CH
-out = layers.Dense(out_units, activation="linear", name="forecast_flat")(x)
-# reshape to (horizon, tot_ch)
-out_seq = layers.Reshape((HORIZON, TOTAL_OUT_CH), name="forecast_seq")(out)
-
-model = models.Model([ac_in, vb_in, ct_in, mask_in], out_seq)
-model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
-model.summary()
-
-# ------------- datasets -------------
-def make_dataset(Xa, Xv, Xc, masks_in, y_in, batch_size=BATCH_SIZE, training=True):
-    ds = tf.data.Dataset.from_tensor_slices(((Xa, Xv, Xc, masks_in), y_in))
-    if training:
-        ds = ds.shuffle(4096, seed=RANDOM_STATE)
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds
-
-train_ds = make_dataset(Xac_tr_s, Xvb_tr_s, Xct_tr_s, masks_tr, Y_tr_s, training=True)
-val_ds = make_dataset(Xac_val_s, Xvb_val_s, Xct_val_s, masks_val, Y_val_s, training=False)
-
-# ------------- callbacks & train -------------
-ckpt_path = os.path.join(MODELS_DIR, "multimodal_lstm_forecast_best.h5")
-ckpt = callbacks.ModelCheckpoint(ckpt_path, save_best_only=True, monitor="val_loss", mode="min")
-es = callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True)
-
-history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=[ckpt, es])
-
-# ------------- save model and artifacts -------------
-model.save(os.path.join(MODELS_DIR, "multimodal_lstm_forecast_final.h5"))
-joblib.dump({
-    "acoustic_scaler": sc_ac,
-    "vibration_scaler": sc_vb,
-    "current_scaler": sc_ct,
-    "y_scaler": sc_y,
-    "meta": {"SEQ_LEN": SEQ_LEN, "TARGET_FS": TARGET_FS, "HORIZON": HORIZON, "AC_CH": AC_CH, "VB_CH": VB_CH, "CT_CH": CT_CH}
-}, os.path.join(MODELS_DIR, "multimodal_lstm_forecast_artifacts.joblib"))
-
-print("Saved forecast model and artifacts to", MODELS_DIR)
+if __name__ == "__main__":
+    main()
