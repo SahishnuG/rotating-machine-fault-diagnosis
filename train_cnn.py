@@ -1,531 +1,913 @@
+#!/usr/bin/env python3
 """
-Spectrogram pipeline + PyTorch CNNs for three modalities (acoustic, vibration, current_temp).
+train_federated_multitask_cnn.py
 
-Features:
-- Stream large CSVs in chunks to avoid memory blowup.
-- Estimate sampling rate from timestamps and resample/interpolate windows to uniform sampling.
-- Convert windows to spectrograms (log-power) per channel, stack channels for multi-channel modalities.
-- Save spectrograms + labels as .npy batches or use an on-the-fly generator.
-- Train three CNNs (one per modality) each with two heads: condition (multi-class) and severity (multi-class).
-- Inference function that accepts three raw signals and returns predictions using trained models.
+Multitask Federated CNN per modality (condition + severity) with a
+final full-coverage fine-tune that sees ALL time columns of ALL scalograms.
 
-Notes before running:
-- Tested with Python 3.8+. Requires: numpy, pandas, scipy, torch, torchvision. Optionally tqdm.
-- Adjust CHUNK_SIZE, WINDOW_SEC, HOP_SEC, TARGET_FS, and spectrogram params to match your data and compute budget.
-- For extremely large datasets, consider converting spectrograms to an LMDB/TFRecord store rather than lots of .npy files.
+Update: Vibration now uses TRUE 4-channel fusion (x_A, y_A, x_B, y_B) per window.
+Acoustic remains single-channel.
 
+Key ideas:
+- FL rounds: memory-safe training via (freq slice, time stride, fixed crop)
+- Final pass: deterministic tiling so the model trains on the ENTIRE data
+- AMP (version-compatible), AdamW + cosine, label smoothing, grad clipping
+- Robust label parsing incl. Unbalalnce->Unbalance, normal->Normal, severity fallback.
 """
 
-import os
-import re
-import math
-import glob
-import json
-from typing import List, Tuple, Dict, Generator
+import os, re, gc, json, math, glob, time, argparse, random, contextlib
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
-import pandas as pd
-from scipy import signal, ndimage
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = lambda x: x
+# ------------------------------
+# AMP compatibility helpers
+# ------------------------------
+def make_grad_scaler(amp_enabled: bool):
+    if not amp_enabled:
+        return None
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler(enabled=True)
+        except TypeError:
+            return torch.cuda.amp.GradScaler(enabled=True)
+    return torch.cuda.amp.GradScaler(enabled=True)
 
-# -----------------------------
-# Configuration
-# -----------------------------
-CHUNK_ROWS = 1_000_000  # pandas read_csv chunk size
-MIN_ROWS_FOR_FS = 1000  # rows to estimate sampling frequency
-TARGET_FS = {
-    'acoustic': 44100,    # target sampling rate (Hz) for acoustic (adjust if necessary)
-    'vibration': 5000,    # target fs for vibration
-    'current_temp': 1     # temperature/current sampled at 1 Hz in example
+@contextlib.contextmanager
+def autocast_ctx(amp_enabled: bool, device: torch.device):
+    if not amp_enabled or device.type != "cuda":
+        yield
+        return
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        try:
+            with torch.amp.autocast(device_type="cuda", enabled=True):
+                yield
+                return
+        except TypeError:
+            try:
+                with torch.amp.autocast("cuda"):
+                    yield
+                    return
+            except TypeError:
+                pass
+    with torch.cuda.amp.autocast():
+        yield
+
+# ------------------------------
+# Repro
+# ------------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ------------------------------
+# Labels / parsing
+# ------------------------------
+CONDITION_ALIASES = {
+    "normal": "Normal",
+    "NORMAL": "Normal",
+    "Unbalalnce": "Unbalance",  # dataset typo
 }
-WINDOW_SEC = 1.0   # spectrogram window length in seconds
-HOP_SEC = 0.5      # hop length in seconds
-NFFT = 1024        # nfft for spectrogram
-SPEC_SIZE = (128, 128)  # final spectrogram height x width (freq x time)
+ACOUSTIC_CONDITIONS  = ["BPFI", "BPFO", "Normal"]
+VIBRATION_CONDITIONS = ["BPFI", "BPFO", "Misalign", "Normal", "Unbalance"]
 
-# Model & training settings (examples)
-BATCH_SIZE = 32
-NUM_WORKERS = 4
-EPOCHS = 20
-LR = 1e-3
+def canonical_condition(name: str) -> str:
+    name = (name or "").strip()
+    if name in CONDITION_ALIASES:
+        return CONDITION_ALIASES[name]
+    if name.lower() == "normal":
+        return "Normal"
+    return name
 
-# Map typo Unbalalnce -> Unbalance
-CONDITION_FIXES = {'Unbalalnce': 'Unbalance'}
-
-# -----------------------------
-# Utility functions
-# -----------------------------
-
-def parse_filename(fn: str) -> Dict[str,str]:
-    """Parse filenames like '0Nm_BPFI_03.csv' into load, condition, severity."""
-    base = os.path.basename(fn)
-    m = re.match(r"(?P<load>[^_]+)_(?P<condition>[^_]+)_(?P<severity>[^.]+)\\.?", base)
-    if not m:
-        return {'load': '', 'condition': '', 'severity': ''}
-    d = m.groupdict()
-    # fix condition typos
-    d['condition'] = CONDITION_FIXES.get(d['condition'], d['condition'])
-    return d
-
-
-def estimate_fs(timestamps: np.ndarray) -> float:
-    """Estimate sampling frequency from timestamps (seconds)."""
-    if len(timestamps) < 2:
-        return 1.0
-    diffs = np.diff(timestamps)
-    # ignore zeros and negatives
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return 1.0
-    median_dt = np.median(diffs)
-    if median_dt <= 0:
-        return 1.0
-    return float(round(1.0 / median_dt))
-
-
-def resample_signal(times: np.ndarray, values: np.ndarray, target_fs: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Interpolate values to a uniform grid at target_fs.
-    Returns (new_times, new_values)
+def parse_labels_from_source(source_csv: str):
     """
-    if len(times) < 2:
-        # trivial
-        new_times = np.arange(0, 1.0, 1.0 / target_fs)
-        new_values = np.zeros_like(new_times)
-        return new_times, new_values
-
-    t0, t1 = times[0], times[-1]
-    duration = t1 - t0
-    if duration <= 0:
-        # degenerate
-        new_times = np.arange(0, 1.0, 1.0 / target_fs)
-        new_values = np.zeros_like(new_times)
-        return new_times, new_values
-
-    num = max(2, int(np.floor(duration * target_fs)))
-    new_times = np.linspace(times[0], times[-1], num)
-    new_values = np.interp(new_times, times, values)
-    return new_times, new_values
-
-
-def compute_log_spectrogram(signal_1d: np.ndarray, fs: float, nfft: int = NFFT, window_sec: float = WINDOW_SEC, hop_sec: float = HOP_SEC) -> np.ndarray:
-    nperseg = int(window_sec * fs)
-    noverlap = int((window_sec - hop_sec) * fs)
-    if nperseg < 8:
-        nperseg = min(256, len(signal_1d))
-        noverlap = int(nperseg * 0.5)
-    freqs, times, Sxx = signal.spectrogram(signal_1d, fs=fs, window='hann', nperseg=nperseg, noverlap=noverlap, nfft=nfft, scaling='density', mode='magnitude')
-    # convert to log-scale (dB)
-    Sxx = np.where(Sxx <= 1e-12, 1e-12, Sxx)
-    Sxx_db = 10.0 * np.log10(Sxx)
-    # normalize to 0-1
-    Sxx_db -= Sxx_db.min()
-    Sxx_db /= (Sxx_db.max() + 1e-6)
-    return Sxx_db
-
-
-def resize_spectrogram(spec: np.ndarray, target_size: Tuple[int,int]=SPEC_SIZE) -> np.ndarray:
-    """Resize spectrogram (freq x time) to target_size using zoom.
-    Uses scipy.ndimage.zoom which is fast and avoids OpenCV dependency.
+    Accepts:
+      - aaaaNm_bbbb_cccc.csv  -> load, condition, severity
+      - aaaaNm_bbbb.csv       -> load, condition, severity='00'
     """
-    h, w = spec.shape
-    th, tw = target_size
-    zoom_h = th / float(h) if h>0 else 1.0
-    zoom_w = tw / float(w) if w>0 else 1.0
-    spec_resized = ndimage.zoom(spec, (zoom_h, zoom_w), order=1)
-    return spec_resized
-
-# -----------------------------
-# Streaming generator: from CSV -> spectrogram windows
-# -----------------------------
-
-def spectrograms_from_csv(file_path: str, modality: str, channels: List[str], target_fs: int=None) -> Generator[Tuple[np.ndarray, Dict[str,str]], None, None]:
-    """Yield spectrogram windows as numpy arrays and metadata labels for a single CSV file.
-    For multi-channel modalities, stack per-channel spectrograms into a C x H x W array.
-
-    Yields: (spec_array, labels) where spec_array shape = (C, H, W)
-    labels: {'condition','severity','load'}
-    """
-    if target_fs is None:
-        target_fs = TARGET_FS.get(modality, 1000)
-
-    # read a small portion to estimate fs
-    reader = pd.read_csv(file_path, nrows=MIN_ROWS_FOR_FS)
-    if reader.shape[0] < 2:
-        # fallback
-        est_fs = target_fs
+    base = os.path.splitext(os.path.basename(source_csv))[0]
+    parts = [p for p in base.split("_") if p]
+    if len(parts) >= 3:
+        load = parts[0]
+        condition = canonical_condition(parts[1])
+        severity = parts[2]
+    elif len(parts) == 2:
+        load = parts[0]
+        condition = canonical_condition(parts[1])
+        severity = "00"
     else:
-        ts = reader.iloc[:,0].to_numpy(dtype=float)
-        est_fs = estimate_fs(ts)
+        load = parts[0] if parts else "UNK"
+        condition = "Normal"
+        severity = "00"
+    return load, condition, severity
 
-    # create pandas iterator to stream full file
-    col_names = None
-    # We'll read full file but by chunks and assemble a rolling buffer per channel
-    col_iter = pd.read_csv(file_path, chunksize=CHUNK_ROWS)
-
-    # rolling buffer
-    buffer_times = np.array([], dtype=float)
-    buffer_channels = {ch: np.array([], dtype=float) for ch in channels}
-
-    parse_info = parse_filename(file_path)
-
-    for chunk in col_iter:
-        # Ensure columns present; handle extra columns
-        # Time Stamp may be first column; ensure it's named 'Time Stamp' or take first column
-        if 'Time Stamp' in chunk.columns:
-            times = chunk['Time Stamp'].to_numpy(dtype=float)
-        else:
-            times = chunk.iloc[:,0].to_numpy(dtype=float)
-
-        # Gather channel columns
-        for ch in channels:
-            if ch in chunk.columns:
-                vals = chunk[ch].to_numpy(dtype=float)
-            else:
-                # if not present, fill zeros
-                vals = np.zeros_like(times, dtype=float)
-            buffer_channels[ch] = np.concatenate([buffer_channels[ch], vals])
-        buffer_times = np.concatenate([buffer_times, times])
-
-        # Process buffer into uniform-spaced signal by resampling then windowing
-        # we only proceed if buffer has at least some duration
-        while True:
-            if len(buffer_times) < 2:
-                break
-            duration = buffer_times[-1] - buffer_times[0]
-            if duration < WINDOW_SEC:
-                # not enough data yet
-                break
-            # take a window of WINDOW_SEC from start
-            window_start_time = buffer_times[0]
-            window_end_time = window_start_time + WINDOW_SEC
-            # select indices within window
-            idx = np.where((buffer_times >= window_start_time) & (buffer_times <= window_end_time))[0]
-            if len(idx) < 2:
-                # advance buffer by dropping first sample
-                buffer_times = buffer_times[1:]
-                for ch in channels:
-                    buffer_channels[ch] = buffer_channels[ch][1:]
-                continue
-
-            # extract and resample each channel
-            channel_specs = []
-            for ch in channels:
-                segment_times = buffer_times[idx]
-                segment_vals = buffer_channels[ch][idx]
-                # resample to uniform grid
-                _, resampled = resample_signal(segment_times, segment_vals, target_fs)
-                spec = compute_log_spectrogram(resampled, fs=target_fs)
-                spec = resize_spectrogram(spec, SPEC_SIZE)
-                channel_specs.append(spec)
-
-            # stack to C x H x W
-            spec_stack = np.stack(channel_specs, axis=0).astype(np.float32)
-
-            yield spec_stack, parse_info
-
-            # advance buffer by HOP_SEC (convert to number of original samples approx)
-            advance_time = HOP_SEC
-            # drop samples <= window_start_time + advance_time
-            new_start = window_start_time + advance_time
-            keep_idx = np.where(buffer_times >= new_start)[0]
-            if len(keep_idx) == 0:
-                buffer_times = np.array([], dtype=float)
-                for ch in channels:
-                    buffer_channels[ch] = np.array([], dtype=float)
-            else:
-                buffer_times = buffer_times[keep_idx]
-                for ch in channels:
-                    buffer_channels[ch] = buffer_channels[ch][keep_idx]
-
-    # end for chunks
-
-# -----------------------------
-# Save spectrograms for entire folders (optional step)
-# -----------------------------
-
-def build_dataset_from_folder(folder: str, modality: str, channels: List[str], out_dir: str):
-    """Iterate CSVs in folder, generate spectrograms and save .npy files + labels.json
-    Each saved batch file contains N examples: dict with keys 'X' (numpy array N x C x H x W) and 'labels' (list of dicts)
+# ------------------------------
+# Dataset (single-channel, used for acoustic)
+# ------------------------------
+class ScalogramDataset(Dataset):
     """
-    os.makedirs(out_dir, exist_ok=True)
-    files = sorted(glob.glob(os.path.join(folder, '*.csv')))
-    batch = []
-    labels = []
-    batch_idx = 0
-    saved_files = []
-    for fp in tqdm(files):
-        for spec, info in spectrograms_from_csv(fp, modality, channels):
-            batch.append(spec)
-            labels.append(info)
-            if len(batch) >= 1024:
-                arr = np.stack(batch, axis=0)
-                outp = os.path.join(out_dir, f'{modality}_batch_{batch_idx:05d}.npz')
-                np.savez_compressed(outp, X=arr, labels=json.dumps(labels))
-                saved_files.append(outp)
-                batch = []
-                labels = []
-                batch_idx += 1
-    if len(batch) > 0:
-        arr = np.stack(batch, axis=0)
-        outp = os.path.join(out_dir, f'{modality}_batch_{batch_idx:05d}.npz')
-        np.savez_compressed(outp, X=arr, labels=json.dumps(labels))
-        saved_files.append(outp)
-    return saved_files
+    Single-channel (acoustic) memory-safe dataset:
+      - optional frequency slice
+      - time stride
+      - fixed time crop (random/center)
+      - per-sample log1p + zscore
+    Returns x -> (1, F, Tcrop)
+    """
+    def __init__(
+        self,
+        items: List[Tuple[str, str]],                 # (npy_path, meta_json_path)
+        condition_to_idx: Dict[str, int],
+        severity_to_idx: Dict[str, int],
+        log_amplitude: bool = True,
+        freq_start: Optional[int] = None,
+        freq_end:   Optional[int] = 128,
+        col_stride: int = 16,
+        time_crop:  Optional[int] = 512,
+        center_crop: bool = False,
+    ):
+        self.items = items
+        self.condition_to_idx = condition_to_idx
+        self.severity_to_idx  = severity_to_idx
+        self.log_amplitude    = log_amplitude
+        self.freq_start = freq_start
+        self.freq_end   = freq_end
+        self.col_stride = max(1, int(col_stride))
+        self.time_crop  = time_crop
+        self.center_crop = center_crop
 
-# -----------------------------
-# PyTorch Dataset - loads precomputed .npz or accepts generator
-# -----------------------------
-class SpectrogramDataset(Dataset):
-    def __init__(self, npz_files: List[str], label_map: Dict[str,int]=None, severity_map: Dict[str,int]=None, transform=None):
-        self.files = npz_files
-        self.transform = transform
-        self.samples = []  # list of tuples (file_idx, within_file_idx)
-        self.data_index = []
-        self.label_map = label_map or {}
-        self.severity_map = severity_map or {}
-        # build index
-        for fidx, f in enumerate(self.files):
-            meta = np.load(f, allow_pickle=True)
-            X = meta['X']
-            labels = json.loads(meta['labels'].tolist()) if isinstance(meta['labels'], np.ndarray) else json.loads(meta['labels'])
-            n = X.shape[0]
-            for i in range(n):
-                self.data_index.append((f, i))
-
-    def __len__(self):
-        return len(self.data_index)
+    def __len__(self): return len(self.items)
 
     def __getitem__(self, idx):
-        f, i = self.data_index[idx]
-        meta = np.load(f, allow_pickle=True)
-        X = meta['X'][i]
-        labels = json.loads(meta['labels'].tolist())[i]
-        # parse labels
-        condition = labels.get('condition', 'unknown')
-        severity = labels.get('severity', '0')
-        # map to int
-        y_cond = self.label_map.get(condition, -1)
-        y_sev = self.severity_map.get(severity, -1)
-        x = X.astype(np.float32)
-        if self.transform:
-            x = self.transform(x)
-        return torch.from_numpy(x), torch.tensor(y_cond, dtype=torch.long), torch.tensor(y_sev, dtype=torch.long)
+        npy_path, meta_path = self.items[idx]
+        with open(meta_path, "r") as fh:
+            meta = json.load(fh)
+        source_csv = meta.get("source_csv")
+        _, cond, sev = parse_labels_from_source(source_csv)
 
-# -----------------------------
-# Simple CNN model with two heads
-# -----------------------------
-class SimpleCNNMultiHead(nn.Module):
-    def __init__(self, in_channels: int, num_conditions: int, num_severity: int):
+        arr = np.load(npy_path, mmap_mode="r")  # (F,T)
+        X = np.array(arr, dtype=np.float32, copy=False)
+
+        # frequency slice
+        f0 = 0 if self.freq_start is None else max(0, int(self.freq_start))
+        f1 = X.shape[0] if self.freq_end is None else min(X.shape[0], int(self.freq_end))
+        X = X[f0:f1, :]
+
+        # time stride
+        if self.col_stride > 1:
+            X = X[:, ::self.col_stride]
+
+        # time crop
+        if self.time_crop is not None and X.shape[1] > self.time_crop:
+            T = X.shape[1]
+            if self.center_crop:
+                s = (T - self.time_crop) // 2
+            else:
+                s = np.random.randint(0, T - self.time_crop + 1)
+            X = X[:, s:s + self.time_crop]
+
+        # normalization (per-sample)
+        if self.log_amplitude:
+            X = np.log1p(X)
+        mu, sd = X.mean(), X.std() + 1e-6
+        X = (X - mu) / sd
+        X = np.expand_dims(X, axis=0)  # (1,F,T)
+
+        y_cond = self.condition_to_idx[canonical_condition(cond)]
+        if sev in self.severity_to_idx:
+            y_sev = self.severity_to_idx[sev]
+        else:
+            def num(s):
+                n = re.sub(r"\D","", s or "")
+                return int(n) if n else 0
+            target = num(sev)
+            key = min(self.severity_to_idx.keys(), key=lambda k: abs(num(k) - target))
+            y_sev = self.severity_to_idx[key]
+
+        return torch.from_numpy(X), torch.tensor(y_cond, dtype=torch.long), torch.tensor(y_sev, dtype=torch.long)
+
+# ------------------------------
+# Vibration: 4-channel grouping & datasets
+# ------------------------------
+VIB_CH_ORDER = [
+    "x_direction_housing_A",
+    "y_direction_housing_A",
+    "x_direction_housing_B",
+    "y_direction_housing_B",
+]
+
+def discover_items(modality_dir: str) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of (npy_path, meta_path, source_csv)
+    """
+    items = []
+    for npy in sorted(glob.glob(os.path.join(modality_dir, "*.npy"))):
+        meta = npy + ".meta.json"
+        if not os.path.exists(meta):
+            continue
+        try:
+            with open(meta, "r") as fh:
+                m = json.load(fh)
+            src = m.get("source_csv")
+            if not src:
+                continue
+        except Exception:
+            continue
+        items.append((npy, meta, src))
+    return items
+
+def group_vibration_items(items: List[Tuple[str, str, str]]):
+    """
+    items: list of (npy_path, meta_path, source_csv)
+    returns:
+      - grouped: dict[(source_csv, window_index)] -> list[(npy, meta)] ordered per VIB_CH_ORDER (subset allowed)
+      - by_source: dict[source_csv] -> List[List[(npy, meta)]]
+    """
+    buckets: Dict[Tuple[str,int], Dict[str, Tuple[str,str]]] = {}
+    for npy, meta, src in items:
+        with open(meta, "r") as fh:
+            m = json.load(fh)
+        win = int(m.get("window_index", 0))
+        ch  = m.get("channel", "")
+        key = (src, win)
+        buckets.setdefault(key, {})[ch] = (npy, meta)
+
+    grouped: Dict[Tuple[str,int], List[Tuple[str,str]]] = {}
+    for key, chmap in buckets.items():
+        lst = [chmap[ch] for ch in VIB_CH_ORDER if ch in chmap]
+        if lst:  # keep groups with at least 1 channel (ideally 4)
+            grouped[key] = lst
+
+    by_source: Dict[str, List[List[Tuple[str,str]]]] = {}
+    for (src, win), lst in grouped.items():
+        by_source.setdefault(src, []).append(lst)
+
+    return grouped, by_source
+
+class ScalogramDataset4Ch(Dataset):
+    """
+    Vibration ONLY: stacks up to 4 channels for the same (source_csv, window_index).
+    Returns x -> (C<=4, F, Tcrop)
+    """
+    def __init__(
+        self,
+        groups: List[List[Tuple[str, str]]],  # list of lists of (npy, meta) in VIB_CH_ORDER
+        condition_to_idx: Dict[str, int],
+        severity_to_idx: Dict[str, int],
+        log_amplitude: bool = True,
+        freq_start: Optional[int] = None,
+        freq_end:   Optional[int] = 128,
+        col_stride: int = 16,
+        time_crop:  Optional[int] = 512,
+        center_crop: bool = False,
+    ):
+        # sanity: groups should be List[List[(npy, meta)]]
+        if not isinstance(groups, list) or (len(groups) > 0 and not isinstance(groups[0], list)):
+            raise TypeError(
+                "ScalogramDataset4Ch expects groups=List[List[(npy, meta)]]. "
+                "It looks like a flat list was passed."
+            )
+        self.groups = groups
+        self.condition_to_idx = condition_to_idx
+        self.severity_to_idx  = severity_to_idx
+        self.log_amplitude    = log_amplitude
+        self.freq_start = freq_start
+        self.freq_end   = freq_end
+        self.col_stride = max(1, int(col_stride))
+        self.time_crop  = time_crop
+        self.center_crop = center_crop
+
+    def __len__(self): return len(self.groups)
+
+    def _load_label(self, meta_path):
+        with open(meta_path, "r") as fh:
+            m = json.load(fh)
+        src = m.get("source_csv")
+        _, cond, sev = parse_labels_from_source(src)
+        return canonical_condition(cond), sev
+
+    def __getitem__(self, idx):
+        group = self.groups[idx]
+        xs = []
+        cond, sev = None, None
+        for (npy_path, meta_path) in group:
+            if cond is None:
+                c, s = self._load_label(meta_path)
+                cond, sev = c, s
+            arr = np.load(npy_path, mmap_mode="r")  # (F,T)
+            X = np.array(arr, dtype=np.float32, copy=False)
+            # freq slice
+            f0 = 0 if self.freq_start is None else max(0, int(self.freq_start))
+            f1 = X.shape[0] if self.freq_end is None else min(X.shape[0], int(self.freq_end))
+            X = X[f0:f1, :]
+            # stride
+            if self.col_stride > 1:
+                X = X[:, ::self.col_stride]
+            xs.append(X)
+
+        # align T across channels (post-stride)
+        Tm = min(x.shape[1] for x in xs)
+        xs = [x[:, :Tm] for x in xs]
+        X = np.stack(xs, axis=0)  # (C,F,T)
+
+        # crop
+        if self.time_crop is not None and X.shape[2] > self.time_crop:
+            T = X.shape[2]
+            s = (T - self.time_crop)//2 if self.center_crop else np.random.randint(0, T - self.time_crop + 1)
+            X = X[:, :, s:s+self.time_crop]
+
+        # per-channel normalize
+        if self.log_amplitude:
+            X = np.log1p(X)
+        mu = X.mean(axis=(1,2), keepdims=True)
+        sd = X.std(axis=(1,2), keepdims=True) + 1e-6
+        X = (X - mu) / sd
+
+        y_cond = self.condition_to_idx[cond]
+        if sev in self.severity_to_idx:
+            y_sev = self.severity_to_idx[sev]
+        else:
+            def num(s):
+                n = re.sub(r"\D","", s or "")
+                return int(n) if n else 0
+            target = num(sev)
+            key = min(self.severity_to_idx.keys(), key=lambda k: abs(num(k) - target))
+            y_sev = self.severity_to_idx[key]
+
+        return torch.from_numpy(X), torch.tensor(y_cond, dtype=torch.long), torch.tensor(y_sev, dtype=torch.long)
+
+class FullCoverageScalogramDataset4Ch(Dataset):
+    """
+    Vibration ONLY: deterministic tiling after stride, stacking channels per window.
+    Returns x -> (C<=4, F, tile_len)
+    """
+    def __init__(
+        self,
+        groups: List[List[Tuple[str, str]]],  # list of lists of (npy, meta)
+        condition_to_idx: Dict[str, int],
+        severity_to_idx: Dict[str, int],
+        log_amplitude: bool = True,
+        freq_start: Optional[int] = None,
+        freq_end:   Optional[int] = 128,
+        col_stride: int = 8,
+        tile_len:   int = 1024,
+        tile_overlap: int = 256,
+    ):
+        # sanity: groups should be List[List[(npy, meta)]]
+        if not isinstance(groups, list) or (len(groups) > 0 and not isinstance(groups[0], list)):
+            raise TypeError(
+                "FullCoverageScalogramDataset4Ch expects groups=List[List[(npy, meta)]]. "
+                "It looks like a flat list was passed."
+            )
+        self.groups = groups
+        self.condition_to_idx = condition_to_idx
+        self.severity_to_idx  = severity_to_idx
+        self.log_amplitude    = log_amplitude
+        self.freq_start = freq_start
+        self.freq_end   = freq_end
+        self.col_stride = max(1, int(col_stride))
+        self.tile_len   = max(1, int(tile_len))
+        self.tile_overlap = max(0, int(tile_overlap))
+
+        # build index (group_idx, tile_start)
+        self.index: List[Tuple[int,int]] = []
+        for gi, g in enumerate(self.groups):
+            if not g or not isinstance(g[0], (list, tuple)) or not isinstance(g[0][0], str):
+                raise TypeError(f"Bad group at index {gi}: expected list of (npy_path, meta_path) tuples.")
+            arr = np.load(g[0][0], mmap_mode="r")
+            T = arr.shape[1]
+            T_post = (T + self.col_stride - 1)//self.col_stride
+            if T_post <= self.tile_len:
+                self.index.append((gi, 0))
+            else:
+                step = max(1, self.tile_len - self.tile_overlap)
+                s = 0
+                while s + self.tile_len <= T_post:
+                    self.index.append((gi, s))
+                    s += step
+                if s < T_post:
+                    self.index.append((gi, max(0, T_post - self.tile_len)))
+
+    def __len__(self): return len(self.index)
+
+    def _load_label(self, meta_path):
+        with open(meta_path, "r") as fh:
+            m = json.load(fh)
+        src = m.get("source_csv")
+        _, cond, sev = parse_labels_from_source(src)
+        return canonical_condition(cond), sev
+
+    def __getitem__(self, j):
+        gi, t0 = self.index[j]
+        group = self.groups[gi]
+        xs = []
+        cond, sev = None, None
+        for (npy_path, meta_path) in group:
+            if cond is None:
+                c, s = self._load_label(meta_path)
+                cond, sev = c, s
+            arr = np.load(npy_path, mmap_mode="r")
+            X = np.array(arr, dtype=np.float32, copy=False)
+            f0 = 0 if self.freq_start is None else max(0, int(self.freq_start))
+            f1 = X.shape[0] if self.freq_end is None else min(X.shape[0], int(self.freq_end))
+            X = X[f0:f1, :]
+            if self.col_stride > 1:
+                X = X[:, ::self.col_stride]
+            T = X.shape[1]
+            if self.tile_len >= T:
+                X = X[:, :self.tile_len] if self.tile_len <= T else np.pad(X, ((0,0),(0,self.tile_len-T)))
+            else:
+                X = X[:, t0:t0+self.tile_len]
+            xs.append(X)
+
+        Tm = min(x.shape[1] for x in xs)
+        xs = [x[:, :Tm] for x in xs]
+        X = np.stack(xs, axis=0)  # (C,F,T)
+
+        if self.log_amplitude:
+            X = np.log1p(X)
+        mu = X.mean(axis=(1,2), keepdims=True)
+        sd = X.std(axis=(1,2), keepdims=True) + 1e-6
+        X = (X - mu) / sd
+
+        y_cond = self.condition_to_idx[cond]
+        if sev in self.severity_to_idx:
+            y_sev = self.severity_to_idx[sev]
+        else:
+            def num(s):
+                n = re.sub(r"\D","", s or "")
+                return int(n) if n else 0
+            target = num(sev)
+            key = min(self.severity_to_idx.keys(), key=lambda k: abs(num(k) - target))
+            y_sev = self.severity_to_idx[key]
+
+        return torch.from_numpy(X), torch.tensor(y_cond, dtype=torch.long), torch.tensor(y_sev, dtype=torch.long)
+
+# ------------------------------
+# Single-channel full coverage dataset (for acoustic)
+# ------------------------------
+class FullCoverageScalogramDataset(Dataset):
+    """
+    Single-channel: deterministic tiling over time to cover ENTIRE width.
+    Returns x -> (1, F, tile_len)
+    """
+    def __init__(
+        self,
+        items: List[Tuple[str, str]],                  # (npy, meta)
+        condition_to_idx: Dict[str, int],
+        severity_to_idx: Dict[str, int],
+        log_amplitude: bool = True,
+        freq_start: Optional[int] = None,
+        freq_end:   Optional[int] = 128,
+        col_stride: int = 8,
+        tile_len:   int = 1024,
+        tile_overlap: int = 256,
+    ):
+        self.base = items
+        self.condition_to_idx = condition_to_idx
+        self.severity_to_idx  = severity_to_idx
+        self.log_amplitude    = log_amplitude
+        self.freq_start = freq_start
+        self.freq_end   = freq_end
+        self.col_stride = max(1, int(col_stride))
+        self.tile_len   = max(1, int(tile_len))
+        self.tile_overlap = max(0, int(tile_overlap))
+
+        self.index: List[Tuple[int,int]] = []
+        for i, (npy_path, _) in enumerate(self.base):
+            arr = np.load(npy_path, mmap_mode="r")
+            T = arr.shape[1]
+            T_post = (T + self.col_stride - 1)//self.col_stride
+            if T_post <= self.tile_len:
+                self.index.append((i, 0))
+            else:
+                step = max(1, self.tile_len - self.tile_overlap)
+                s = 0
+                while s + self.tile_len <= T_post:
+                    self.index.append((i, s))
+                    s += step
+                if s < T_post:
+                    self.index.append((i, max(0, T_post - self.tile_len)))
+
+    def __len__(self): return len(self.index)
+
+    def __getitem__(self, j):
+        i, t0 = self.index[j]
+        npy_path, meta_path = self.base[i]
+        with open(meta_path, "r") as fh:
+            m = json.load(fh)
+        src = m.get("source_csv")
+        _, cond, sev = parse_labels_from_source(src)
+
+        arr = np.load(npy_path, mmap_mode="r")
+        X = np.array(arr, dtype=np.float32, copy=False)  # (F,T)
+
+        f0 = 0 if self.freq_start is None else max(0, int(self.freq_start))
+        f1 = X.shape[0] if self.freq_end is None else min(X.shape[0], int(self.freq_end))
+        X = X[f0:f1, :]
+
+        if self.col_stride > 1:
+            X = X[:, ::self.col_stride]
+
+        T = X.shape[1]
+        if self.tile_len >= T:
+            X = X[:, :self.tile_len] if self.tile_len <= T else np.pad(X, ((0,0),(0,self.tile_len-T)))
+        else:
+            X = X[:, t0:t0+self.tile_len]
+
+        if self.log_amplitude:
+            X = np.log1p(X)
+        mu, sd = X.mean(), X.std() + 1e-6
+        X = (X - mu) / sd
+        X = np.expand_dims(X, axis=0)  # (1,F,T)
+
+        y_cond = self.condition_to_idx[canonical_condition(cond)]
+        if sev in self.severity_to_idx:
+            y_sev = self.severity_to_idx[sev]
+        else:
+            def num(s):
+                n = re.sub(r"\D","", s or "")
+                return int(n) if n else 0
+            target = num(sev)
+            key = min(self.severity_to_idx.keys(), key=lambda k: abs(num(k) - target))
+            y_sev = self.severity_to_idx[key]
+
+        return torch.from_numpy(X), torch.tensor(y_cond, dtype=torch.long), torch.tensor(y_sev, dtype=torch.long)
+
+# ------------------------------
+# Model (multitask) with configurable input channels
+# ------------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, c_in, c_out, k=3, p=1, s=1):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4,4)),
-        )
-        self.flatten = nn.Flatten()
-        self.fc_shared = nn.Linear(128*4*4, 256)
-        self.cond_head = nn.Linear(256, num_conditions)
-        self.sev_head = nn.Linear(256, num_severity)
-
+        self.conv = nn.Conv2d(c_in, c_out, k, stride=s, padding=p)
+        self.bn   = nn.BatchNorm2d(c_out)
+        self.act  = nn.ReLU(inplace=True)
     def forward(self, x):
-        # x: B x C x H x W
-        x = self.features(x)
-        x = self.flatten(x)
-        x = F.relu(self.fc_shared(x))
-        return self.cond_head(x), self.sev_head(x)
+        return self.act(self.bn(self.conv(x)))
 
-# -----------------------------
-# Training loop (per modality)
-# -----------------------------
+class MultiTaskCNN(nn.Module):
+    """
+    Early downsampling in time to reduce memory: first MaxPool2d((2,4)).
+    """
+    def __init__(self, n_cond: int, n_sev: int, in_ch: int = 1):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            ConvBlock(in_ch, 32, 5, 2),     # in_ch = 1 (acoustic) or 4 (vibration)
+            nn.MaxPool2d((2, 4)),           # ↓F x2, ↓T x4
+            ConvBlock(32, 64, 3, 1),
+            nn.MaxPool2d((2, 2)),
+            ConvBlock(64, 128, 3, 1),
+            nn.AdaptiveAvgPool2d((4, 8)),
+        )
+        feat_dim = 128 * 4 * 8
+        self.drop = nn.Dropout(0.2)
+        self.fc_cond = nn.Linear(feat_dim, n_cond)
+        self.fc_sev  = nn.Linear(feat_dim, n_sev)
+    def forward(self, x):
+        z = self.backbone(x)
+        z = z.flatten(1)
+        z = self.drop(z)
+        return self.fc_cond(z), self.fc_sev(z)
 
-def train_model(modality: str, train_files: List[str], val_files: List[str], in_channels: int, label_map: Dict[str,int], severity_map: Dict[str,int], save_path: str, epochs=EPOCHS):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_ds = SpectrogramDataset(train_files, label_map=label_map, severity_map=severity_map)
-    val_ds = SpectrogramDataset(val_files, label_map=label_map, severity_map=severity_map)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+# ------------------------------
+# FedAvg helpers
+# ------------------------------
+def get_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    model = SimpleCNNMultiHead(in_channels, len(label_map), len(severity_map)).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
+def set_state_dict(model: nn.Module, state: Dict[str, torch.Tensor]):
+    model.load_state_dict(state, strict=True)
 
-    best_val_loss = float('inf')
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        for xb, ycond, ysev in tqdm(train_loader):
-            xb = xb.to(device)
-            ycond = ycond.to(device)
-            ysev = ysev.to(device)
-            opt.zero_grad()
-            out_cond, out_sev = model(xb)
-            loss = criterion(out_cond, ycond) + criterion(out_sev, ysev)
+def average_states(states: List[Tuple[Dict[str, torch.Tensor], int]]) -> Dict[str, torch.Tensor]:
+    total = sum(n for _, n in states)
+    out: Dict[str, torch.Tensor] = {}
+    for k in states[0][0].keys():
+        acc = None
+        for state, n in states:
+            w = state[k] * (n / total)
+            acc = w if acc is None else acc + w
+        out[k] = acc
+    return out
+
+# ------------------------------
+# Train / Eval
+# ------------------------------
+LABEL_SMOOTH = 0.1
+WEIGHT_DECAY = 1e-2
+CLIP_NORM    = 1.0
+
+def train_one_epoch(model, loader, optimizer, device, scaler=None):
+    model.train()
+    ce = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+    total, loss_sum = 0, 0.0
+    for xb, ycond, ysev in loader:
+        xb, ycond, ysev = xb.to(device, non_blocking=True), ycond.to(device, non_blocking=True), ysev.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        use_amp = (scaler is not None)
+        with autocast_ctx(use_amp, device):
+            pc, ps = model(xb)
+            loss = ce(pc, ycond) + ce(ps, ysev)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             loss.backward()
-            opt.step()
-            running_loss += loss.item() * xb.size(0)
-        epoch_loss = running_loss / len(train_loader.dataset)
+            nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            optimizer.step()
 
-        # validation
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for xb, ycond, ysev in val_loader:
-                xb = xb.to(device)
-                ycond = ycond.to(device)
-                ysev = ysev.to(device)
-                out_cond, out_sev = model(xb)
-                loss = criterion(out_cond, ycond) + criterion(out_sev, ysev)
-                val_loss += loss.item() * xb.size(0)
-        val_loss /= len(val_loader.dataset)
-        print(f"Epoch {epoch+1}/{epochs} - train loss {epoch_loss:.4f}, val loss {val_loss:.4f}")
+        bsz = xb.size(0)
+        loss_sum += float(loss.item()) * bsz
+        total += bsz
+    return loss_sum / max(1, total)
 
-        # checkpoint
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save({'model_state_dict': model.state_dict(), 'label_map': label_map, 'severity_map': severity_map}, save_path)
-            print(f"Saved best model to {save_path}")
-    return save_path
-
-# -----------------------------
-# Helper to build label maps from folder or files
-# -----------------------------
-
-def collect_label_maps_from_npz(npz_files: List[str]) -> Tuple[Dict[str,int], Dict[str,int]]:
-    conds = set()
-    sevs = set()
-    for f in npz_files:
-        meta = np.load(f, allow_pickle=True)
-        labels = json.loads(meta['labels'].tolist()) if isinstance(meta['labels'], np.ndarray) else json.loads(meta['labels'])
-        for l in labels:
-            cond = l.get('condition', 'unknown')
-            sev = l.get('severity', '0')
-            cond = CONDITION_FIXES.get(cond, cond)
-            conds.add(cond)
-            sevs.add(sev)
-    cond_list = sorted(list(conds))
-    sev_list = sorted(list(sevs))
-    cond_map = {c:i for i,c in enumerate(cond_list)}
-    sev_map = {s:i for i,s in enumerate(sev_list)}
-    return cond_map, sev_map
-
-# -----------------------------
-# Inference for 3 new signals
-# -----------------------------
-
-def load_model_for_inference(model_path: str, in_channels: int) -> Tuple[nn.Module, Dict[str,int], Dict[str,int]]:
-    ckpt = torch.load(model_path, map_location='cpu')
-    label_map = ckpt.get('label_map', {})
-    severity_map = ckpt.get('severity_map', {})
-    # invert maps for readable output
-    inv_label_map = {v:k for k,v in label_map.items()}
-    inv_sev_map = {v:k for k,v in severity_map.items()}
-    model = SimpleCNNMultiHead(in_channels, len(label_map), len(severity_map))
-    model.load_state_dict(ckpt['model_state_dict'])
+def evaluate(model, loader, device):
     model.eval()
-    return model, inv_label_map, inv_sev_map
+    ce = nn.CrossEntropyLoss()
+    total, loss_sum = 0, 0.0
+    corr_c, corr_s = 0, 0
+    with torch.no_grad():
+        for xb, ycond, ysev in loader:
+            xb, ycond, ysev = xb.to(device, non_blocking=True), ycond.to(device, non_blocking=True), ysev.to(device, non_blocking=True)
+            pc, ps = model(xb)
+            loss = ce(pc, ycond) + ce(ps, ysev)
+            loss_sum += float(loss.item()) * xb.size(0)
+            corr_c += int((pc.argmax(1) == ycond).sum().item())
+            corr_s += int((ps.argmax(1) == ysev).sum().item())
+            total  += xb.size(0)
+    return (loss_sum / max(1, total),
+            corr_c / max(1, total),
+            corr_s / max(1, total))
 
+# ------------------------------
+# Generic per-source client builder (single-channel case)
+# ------------------------------
+def build_clients(items: List[Tuple[str, str, str]], max_clients: Optional[int] = None):
+    by_src: Dict[str, List[Tuple[str, str]]] = {}
+    for npy, meta, src in items:
+        by_src.setdefault(src, []).append((npy, meta))
+    keys = list(by_src.keys())
+    random.shuffle(keys)
+    if max_clients is not None:
+        keys = keys[:max_clients]
+    return {k: by_src[k] for k in keys}
 
-def predict_from_signals(acoustic_signal: Tuple[np.ndarray, np.ndarray], vibration_signal: Tuple[np.ndarray, Dict[str,np.ndarray]], current_temp_signal: Tuple[np.ndarray, Dict[str,np.ndarray]], model_paths: Dict[str,str], channel_lists: Dict[str,List[str]], target_fs_map: Dict[str,int]=TARGET_FS) -> Dict[str,Tuple[str,str, Dict[str,float]]]:
-    """
-    acoustic_signal: (times, values) for acoustic (1D)
-    vibration_signal: (times, {'x_direction_housing_A': arr, ...})
-    current_temp_signal: (times, {'Temperature_housing_A': arr, ...})
-    model_paths: dict with keys 'acoustic','vibration','current_temp' pointing to saved .pth
-    channel_lists: dict mapping modality to list of channel names (strings)
+# ------------------------------
+# Federated loop (with vibration 4-ch fusion)
+# ------------------------------
+def run_federated_modality(
+    modality: str,
+    data_root: str,
+    rounds: int,
+    clients_per_round: int,
+    local_epochs: int,
+    batch_size: int,
+    lr: float,
+    num_workers: int,
+    amp: bool,
+    max_clients: Optional[int],
+    device: torch.device,
+    save_dir: str,
+    # memory-safe FL params
+    fl_freq_end: Optional[int],
+    fl_col_stride: int,
+    fl_time_crop: Optional[int],
+    # final full-coverage params
+    full_freq_end: Optional[int],
+    full_col_stride: int,
+    full_tile_len: int,
+    full_tile_overlap: int,
+    full_ft_epochs: int,
+    full_ft_lr_scale: float,
+):
+    print(f"\n=== Modality: {modality} | Multitask CNN ===")
+    mod_dir = os.path.join(data_root, modality)
+    base_items = discover_items(mod_dir)
+    if not base_items:
+        print(f"[WARN] No .npy in {mod_dir}")
+        return
 
-    Returns dict mapping modality -> (predicted_condition, predicted_severity, softmax_scores)
-    """
-    results = {}
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # label spaces
+    cond_classes = ACOUSTIC_CONDITIONS if modality == "acoustic" else VIBRATION_CONDITIONS
+    condition_to_idx = {c:i for i,c in enumerate(cond_classes)}
+    sev_present = set()
+    for _, meta, _ in base_items:
+        try:
+            with open(meta, "r") as fh:
+                m = json.load(fh)
+            _, _, sev = parse_labels_from_source(m.get("source_csv", ""))
+            sev_present.add(sev)
+        except Exception:
+            pass
 
-    for modality in ['acoustic','vibration','current_temp']:
-        mp = model_paths[modality]
-        channels = channel_lists[modality]
-        in_ch = len(channels)
-        model, inv_label_map, inv_sev_map = load_model_for_inference(mp, in_ch)
-        model.to(device)
+    def sev_num(s):
+        n = re.sub(r"\D","", s or "")
+        return int(n) if n else 0
+    sev_sorted = sorted(sev_present, key=sev_num) or ["00","01","02","03"]
+    severity_to_idx = {s:i for i,s in enumerate(sev_sorted)}
+    n_cond, n_sev = len(condition_to_idx), len(severity_to_idx)
 
-        # prepare spectrogram for given modality
-        if modality == 'acoustic':
-            times, vals = acoustic_signal
-            _, resampled = resample_signal(times, vals, target_fs_map[modality])
-            spec = compute_log_spectrogram(resampled, fs=target_fs_map[modality])
-            spec = resize_spectrogram(spec, SPEC_SIZE)
-            spec_stack = np.expand_dims(spec, 0)  # C=1
-        elif modality == 'vibration':
-            times, ch_dict = vibration_signal
-            # build per-channel resampled signals
-            specs = []
-            for ch in channels:
-                vals = ch_dict.get(ch, np.zeros_like(times))
-                _, resampled = resample_signal(times, vals, target_fs_map[modality])
-                s = compute_log_spectrogram(resampled, fs=target_fs_map[modality])
-                s = resize_spectrogram(s, SPEC_SIZE)
-                specs.append(s)
-            spec_stack = np.stack(specs, axis=0)
-        else:  # current_temp
-            times, ch_dict = current_temp_signal
-            specs = []
-            for ch in channels:
-                vals = ch_dict.get(ch, np.zeros_like(times))
-                _, resampled = resample_signal(times, vals, target_fs_map[modality])
-                s = compute_log_spectrogram(resampled, fs=target_fs_map[modality])
-                s = resize_spectrogram(s, SPEC_SIZE)
-                specs.append(s)
-            spec_stack = np.stack(specs, axis=0)
+    # ----- build clients -----
+    if modality == "vibration":
+        # group 4-ch windows and assign to clients by source_csv
+        grouped_dict, by_source = group_vibration_items(base_items)
+        clients = by_source
+        total_groups = sum(len(v) for v in by_source.values())
+        print(f"Vibration groups (4-ch windows): {total_groups}")
+    else:
+        clients = build_clients(base_items, max_clients=max_clients)
 
-        x = torch.from_numpy(spec_stack).unsqueeze(0).to(device)  # 1xCxHxW
-        with torch.no_grad():
-            out_cond, out_sev = model(x)
-            pcond = F.softmax(out_cond, dim=1).cpu().numpy()[0]
-            psev = F.softmax(out_sev, dim=1).cpu().numpy()[0]
-            i_cond = int(np.argmax(pcond))
-            i_sev = int(np.argmax(psev))
-            cond_str = inv_label_map.get(i_cond, str(i_cond))
-            sev_str = inv_sev_map.get(i_sev, str(i_sev))
-            results[modality] = (cond_str, sev_str, {'condition_probs': pcond.tolist(), 'severity_probs': psev.tolist()})
-    return results
+    keys = list(clients.keys())
+    random.shuffle(keys)
+    if max_clients is not None:
+        keys = keys[:max_clients]
+    n_clients = len(keys)
+    print(f"Total simulated clients: {n_clients}")
 
-# -----------------------------
-# Example usage (not executed automatically) - instructions
-# -----------------------------
-EXAMPLE = '''
-1) Precompute datasets (optional):
-   build_dataset_from_folder('acoustic/', 'acoustic', channels=['values'], out_dir='data/acoustic_npz')
-   build_dataset_from_folder('vibration/', 'vibration', channels=['x_direction_housing_A','y_direction_housing_A','x_direction_housing_B','y_direction_housing_B'], out_dir='data/vibration_npz')
-   build_dataset_from_folder('current_temp/', 'current_temp', channels=['Temperature_housing_A','Temperature_housing_B','U-phase','V-phase','W-phase'], out_dir='data/current_npz')
+    # holdout
+    val_key = keys[0]
+    val_items = clients[val_key][: max(8, math.ceil(0.01*len(clients[val_key]))) ]
 
-2) Create label maps:
-   cond_map, sev_map = collect_label_maps_from_npz(sorted(glob.glob('data/acoustic_npz/*.npz')))
+    # ----- model -----
+    in_ch = 4 if modality == "vibration" else 1
+    model = MultiTaskCNN(n_cond=n_cond, n_sev=n_sev, in_ch=in_ch).to(device)
 
-3) Train:
-   train_model('acoustic', train_files, val_files, in_channels=1, label_map=cond_map, severity_map=sev_map, save_path='models/acoustic_best.pth')
+    # ----- loader factory -----
+    def make_loader(samples, shuffle, center, freq_end, col_stride, time_crop):
+        if modality == "vibration":
+            ds = ScalogramDataset4Ch(
+                samples, condition_to_idx, severity_to_idx,
+                log_amplitude=True,
+                freq_start=None, freq_end=freq_end,
+                col_stride=col_stride, time_crop=time_crop,
+                center_crop=center,
+            )
+        else:
+            ds = ScalogramDataset(
+                samples, condition_to_idx, severity_to_idx,
+                log_amplitude=True,
+                freq_start=None, freq_end=freq_end,
+                col_stride=col_stride, time_crop=time_crop,
+                center_crop=center,
+            )
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=num_workers, pin_memory=(device.type=='cuda'), drop_last=False)
 
-4) Predict on three signals:
-   acoustic_sig = (times_ac, vals_ac)
-   vibration_sig = (times_v, {'x_direction_housing_A': arrA, 'y_direction_housing_A': arrB, ...})
-   current_sig = (times_c, {'Temperature_housing_A': tA, ...})
-   results = predict_from_signals(acoustic_sig, vibration_sig, current_sig, model_paths={'acoustic':'models/acoustic_best.pth', 'vibration':'models/vibration_best.pth','current_temp':'models/current_best.pth'}, channel_lists=...) 
-'''
+    val_loader = make_loader(val_items, False, True, fl_freq_end, fl_col_stride, fl_time_crop)
+    scaler_enabled = (amp and device.type == 'cuda')
+
+    # ===== Federated rounds =====
+    for rnd in range(1, rounds+1):
+        t0 = time.time()
+        selectable = [k for k in keys if k != val_key] or keys
+        m = min(clients_per_round, len(selectable))
+        chosen = random.sample(selectable, m)
+
+        global_state = get_state_dict(model)
+        updates: List[Tuple[Dict[str, torch.Tensor], int]] = []
+
+        for ck in chosen:
+            train_loader = make_loader(clients[ck], True, False, fl_freq_end, fl_col_stride, fl_time_crop)
+            local = MultiTaskCNN(n_cond, n_sev, in_ch=in_ch).to(device)
+            set_state_dict(local, global_state)
+            opt = torch.optim.AdamW(local.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+            sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=max(1, local_epochs))
+            scaler = make_grad_scaler(amp_enabled=scaler_enabled)
+
+            for _ in range(local_epochs):
+                train_one_epoch(local, train_loader, opt, device, scaler)
+                sched.step()
+
+            n_samples = len(train_loader.dataset)
+            updates.append((get_state_dict(local), n_samples))
+
+            del local, opt, sched, scaler, train_loader
+            torch.cuda.empty_cache(); gc.collect()
+
+        if updates:
+            new_state = average_states(updates)
+            set_state_dict(model, new_state)
+
+        vloss, vacc_c, vacc_s = evaluate(model, val_loader, device)
+        dt = time.time() - t0
+        print(f"Round {rnd:03d} | val_loss {vloss:.4f} | acc(cond) {vacc_c:.4f} | acc(sev) {vacc_s:.4f} | {dt:.1f}s")
+
+    # ===== Final full-coverage fine-tune =====
+    print("\n[INFO] Starting full-coverage fine-tune (see ALL columns of ALL files)...")
+
+    if modality == "vibration":
+        # flatten all 4-ch groups from all clients
+        all_groups = [g for lst in clients.values() for g in lst]
+        full_ds = FullCoverageScalogramDataset4Ch(
+            all_groups, condition_to_idx, severity_to_idx,
+            log_amplitude=True,
+            freq_start=None, freq_end=full_freq_end,
+            col_stride=full_col_stride,
+            tile_len=full_tile_len,
+            tile_overlap=full_tile_overlap,
+        )
+    else:
+        # acoustic: flatten back to list of (npy, meta)
+        all_items = [pair for lst in clients.values() for pair in lst]
+        full_ds = FullCoverageScalogramDataset(
+            all_items, condition_to_idx, severity_to_idx,
+            log_amplitude=True,
+            freq_start=None, freq_end=full_freq_end,
+            col_stride=full_col_stride,
+            tile_len=full_tile_len,
+            tile_overlap=full_tile_overlap,
+        )
+
+    full_loader = DataLoader(full_ds, batch_size=batch_size, shuffle=True,
+                             num_workers=num_workers, pin_memory=(device.type=='cuda'), drop_last=False)
+
+    # smaller LR for fine-tune
+    ft_opt = torch.optim.AdamW(model.parameters(), lr=max(1e-6, lr * full_ft_lr_scale), weight_decay=WEIGHT_DECAY)
+    ft_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(ft_opt, T_0=max(1, full_ft_epochs))
+    ft_scaler = make_grad_scaler(amp_enabled=scaler_enabled)
+
+    for ep in range(1, full_ft_epochs+1):
+        tr = train_one_epoch(model, full_loader, ft_opt, device, ft_scaler)
+        ft_sched.step()
+        vloss, vacc_c, vacc_s = evaluate(model, val_loader, device)
+        print(f"[FT] epoch {ep:02d} | train_loss {tr:.4f} | val_loss {vloss:.4f} | acc(cond) {vacc_c:.4f} | acc(sev) {vacc_s:.4f}")
+
+    # save
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"{modality}_multitask.pt")
+    torch.save(model.state_dict(), out_path)
+    with open(os.path.join(save_dir, f"{modality}_labels.json"), "w") as fh:
+        json.dump({"conditions": list(condition_to_idx.keys()), "severities": list(severity_to_idx.keys())}, fh, indent=2)
+    print(f"Saved: {out_path}")
+
+# ------------------------------
+# Entry
+# ------------------------------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data-root', type=str, default='scalograms')
+    p.add_argument('--save-dir', type=str, default='models')
+
+    # Federated loop
+    p.add_argument('--rounds', type=int, default=10)
+    p.add_argument('--clients-per-round', type=int, default=10)
+    p.add_argument('--local-epochs', type=int, default=1)
+    p.add_argument('--batch-size', type=int, default=16)
+    p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--max-clients', type=int, default=None)
+    p.add_argument('--cuda', action='store_true')
+    p.add_argument('--amp', action='store_true')
+
+    # Memory-safe params for FL rounds
+    p.add_argument('--fl-freq-end', type=int, default=128, help='keep lowest freq bins during FL (None=all)')
+    p.add_argument('--fl-col-stride', type=int, default=16, help='time downsample during FL')
+    p.add_argument('--fl-time-crop', type=int, default=512, help='fixed time crop during FL (None=keep all after stride)')
+
+    # Final full-coverage fine-tune
+    p.add_argument('--full-freq-end', type=int, default=128, help='keep lowest freq bins for final pass')
+    p.add_argument('--full-col-stride', type=int, default=8, help='stride for final coverage (lower = more precise)')
+    p.add_argument('--full-tile-len', type=int, default=1024, help='tile width after stride (covers all tiles)')
+    p.add_argument('--full-tile-overlap', type=int, default=256, help='overlap between tiles (after stride)')
+    p.add_argument('--full-ft-epochs', type=int, default=2, help='epochs for final fine-tune')
+    p.add_argument('--full-ft-lr-scale', type=float, default=0.3, help='LR multiplier vs base lr during fine-tune')
+
+    args = p.parse_args()
+    device = torch.device('cuda' if (args.cuda and torch.cuda.is_available()) else 'cpu')
+    print(f"Device: {device}")
+
+    for modality in ['acoustic', 'vibration']:
+        run_federated_modality(
+            modality=modality,
+            data_root=args.data_root,
+            rounds=args.rounds,
+            clients_per_round=args.clients_per_round,
+            local_epochs=args.local_epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            num_workers=args.num_workers,
+            amp=args.amp,
+            max_clients=args.max_clients,
+            device=device,
+            save_dir=args.save_dir,
+            # FL params
+            fl_freq_end=args.fl_freq_end,
+            fl_col_stride=args.fl_col_stride,
+            fl_time_crop=args.fl_time_crop,
+            # final pass params
+            full_freq_end=args.full_freq_end,
+            full_col_stride=args.full_col_stride,
+            full_tile_len=args.full_tile_len,
+            full_tile_overlap=args.full_tile_overlap,
+            full_ft_epochs=args.full_ft_epochs,
+            full_ft_lr_scale=args.full_ft_lr_scale,
+        )
 
 if __name__ == '__main__':
-    print('This file provides functions to preprocess, train and predict. See EXAMPLE string for usage.')
+    main()

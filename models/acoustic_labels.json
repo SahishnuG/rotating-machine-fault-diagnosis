@@ -1,0 +1,12 @@
+{
+  "conditions": [
+    "BPFI",
+    "BPFO",
+    "Normal"
+  ],
+  "severities": [
+    "00",
+    "03",
+    "10"
+  ]
+}

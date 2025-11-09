@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-make_scalograms.py
+preprocess.py
 
 Generates Morlet CWT scalograms for every CSV in:
   - acoustic/

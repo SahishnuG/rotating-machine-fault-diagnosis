@@ -1,315 +1,500 @@
 #!/usr/bin/env python3
 """
-gradio_multimodal_app.py
+Gradio inference app (Option A: 4-channel vibration fusion)
 
-Gradio frontend for test_cnn.py: lets a user upload up to three CSV sensor files
-(acoustic, vibration, current), runs the same conservative first-window preproc,
-invokes the clean model (loads or rebuilds + loads weights) and returns a
-predicted condition + probability. Also plots the standardized windows.
+- Upload acoustic and/or vibration CSVs
+- Convert to Morlet CWT scalograms (same assumptions as training)
+  * Acoustic: single channel
+  * Vibration: 4 channels (x_A, y_A, x_B, y_B) per window, stacked as 4xFxT
+- Display scalograms in the UI
+- Load trained multitask CNNs (per modality)
+- Predict condition + severity per modality (avg over windows)
+- Produce an ensemble prediction (avg across modalities) if both provided
 
-Run: python gradio_multimodal_app.py
-
+Expected files:
+    models/acoustic_multitask.pt
+    models/acoustic_labels.json
+    models/vibration_multitask.pt
+    models/vibration_labels.json
 """
-import os
-import glob
-import json
-import tempfile
+
+import io, os, json
+from typing import Dict, List, Tuple, Optional, Union
+from pathlib import Path
+
+import gradio as gr
 import numpy as np
 import pandas as pd
-from scipy import interpolate
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, models
-import gradio as gr
+import pywt
+from scipy import signal
 import matplotlib.pyplot as plt
+from PIL import Image
 
-# ---------------- CONFIG (keep in sync with original script) ----------------
-MODELS_DIR = "models"
-CLEAN_MODEL_PATH = os.path.join(MODELS_DIR, "stream_multimodal_clean.h5")
-ORIG_MODEL_PATH  = os.path.join(MODELS_DIR, "stream_multimodal_final.h5")
-LABEL_MAP_PATH   = os.path.join(MODELS_DIR, "label_map.json")
+import torch
+import torch.nn as nn
 
-ACOUSTIC_DIR = "acoustic"
-VIBRATION_DIR = "vibration"
-CURRENT_DIR = "current_temp"
+# --------------------------- CONFIG ---------------------------
+MODEL_DIR = "models"
+ACOUSTIC_WEIGHTS = os.path.join(MODEL_DIR, "acoustic_multitask.pt")
+ACOUSTIC_LABELS  = os.path.join(MODEL_DIR, "acoustic_labels.json")
+VIB_WEIGHTS      = os.path.join(MODEL_DIR, "vibration_multitask.pt")
+VIB_LABELS       = os.path.join(MODEL_DIR, "vibration_labels.json")
 
-TARGET_FS  = 100.0
-WINDOW_SECS = 2.0
-SEQ_LEN = int(TARGET_FS * WINDOW_SECS)
-AC_CH, VB_CH, CT_CH = 1, 4, 5
+# CSV parsing
+TIME_COL_KEYWORDS = ("time", "stamp")
+ACOUSTIC_CHANNELS = ["values"]
+VIBRATION_CHANNELS = [
+    "x_direction_housing_A",
+    "y_direction_housing_A",
+    "x_direction_housing_B",
+    "y_direction_housing_B",
+]
 
-# ---------------- small custom MaskSliceLayer (no Lambda) ----------------
-class MaskSliceLayer(keras.layers.Layer):
-    def __init__(self, index, **kwargs):
-        super().__init__(**kwargs)
-        self.index = int(index)
-    def call(self, x):
-        return tf.expand_dims(x[:, self.index], axis=1)
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"index": self.index})
-        return cfg
+# Signal → scalogram
+WAVELET = "morl"
+N_SCALES = 128
+FREQ_MIN = 20.0
+FREQ_MAX_RATIO = 0.45
+WINDOW_SEC = 0.5
+HOP_SEC = 0.25
 
-# ---------------- conv branch & clean model builder (must match training topology) ----------------
-def conv_branch(seq_len, nch):
-    inp = layers.Input(shape=(seq_len, nch))
-    x = layers.Conv1D(64, 7, strides=2, padding='same', activation='relu')(inp)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPool1D(2)(x)
-    x = layers.Conv1D(128, 5, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPool1D(2)(x)
-    x = layers.Conv1D(256, 3, padding='same', activation='relu')(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dense(128, activation='relu')(x)
-    return models.Model(inp, x)
+# Inference windows
+N_WINDOWS_PER_FILE = 4  # number of evenly spaced windows per file for inference
 
+# Device / AMP
+USE_CUDA = torch.cuda.is_available()
+DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
+AMP_ENABLED = USE_CUDA
 
-def build_clean_model(seq_len=SEQ_LEN, ac_ch=AC_CH, vb_ch=VB_CH, ct_ch=CT_CH, n_classes=2, lr=1e-3):
-    ac_branch = conv_branch(seq_len, ac_ch)
-    vb_branch = conv_branch(seq_len, vb_ch)
-    ct_branch = conv_branch(seq_len, ct_ch)
+# --------------------------- FILE READER (fixes NamedString .read error) ---------------------------
+def read_file_like(x: Union[str, Path, bytes, io.BytesIO, dict]) -> bytes:
+    """
+    Accepts Gradio File outputs: NamedString (path-like), str, Path, dict with 'name', or bytes/BytesIO.
+    Returns raw bytes.
+    """
+    if x is None:
+        return b""
+    # Older/newer Gradio may give dicts: {'name': '/tmp/...csv', ...}
+    if isinstance(x, dict) and "name" in x:
+        x = x["name"]
+    # Path-like
+    if isinstance(x, (str, Path)):
+        p = Path(x)
+        return p.read_bytes()
+    # Bytes-like
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, io.BytesIO):
+        return x.getvalue()
+    # Some builds give an object with .name property
+    name = getattr(x, "name", None)
+    if isinstance(name, (str, Path)) and os.path.exists(name):
+        return Path(name).read_bytes()
+    # Last resort: has .read()?
+    read = getattr(x, "read", None)
+    if callable(read):
+        return x.read()
+    raise TypeError(f"Unsupported file type: {type(x)}")
 
-    ac_in = layers.Input(shape=(seq_len, ac_ch), name="acoustic_input")
-    vb_in = layers.Input(shape=(seq_len, vb_ch), name="vibration_input")
-    ct_in = layers.Input(shape=(seq_len, ct_ch), name="current_input")
-    mask_in = layers.Input(shape=(3,), name="mask_input")
+# --------------------------- UTILITIES ---------------------------
+def find_time_column(df: pd.DataFrame) -> str:
+    cols = list(df.columns)
+    low = [c.lower() for c in cols]
+    for kw in TIME_COL_KEYWORDS:
+        for i, c in enumerate(low):
+            if kw in c:
+                return cols[i]
+    for c in cols:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return cols[0]
 
-    ac_feat = ac_branch(ac_in)
-    vb_feat = vb_branch(vb_in)
-    ct_feat = ct_branch(ct_in)
+def estimate_fs_from_times(times: np.ndarray) -> float:
+    diffs = np.diff(times)
+    diffs_pos = diffs[diffs > 0]
+    if diffs_pos.size == 0:
+        raise ValueError("Cannot estimate sampling rate — no positive time differences.")
+    dt = float(np.median(diffs_pos))
+    return 1.0 / dt
 
-    ac_mask_scalar = MaskSliceLayer(0, name="mask0")(mask_in)
-    vb_mask_scalar = MaskSliceLayer(1, name="mask1")(mask_in)
-    ct_mask_scalar = MaskSliceLayer(2, name="mask2")(mask_in)
+def prepare_scales_for_freqs(fs: float, n_scales: int, fmin: float, fmax_ratio: float):
+    fmax = min(fmax_ratio * fs, fs/2.0)
+    if fmax <= fmin:
+        fmin = max(0.5, fmax * 0.01)
+    freqs = np.logspace(np.log10(fmin), np.log10(fmax), num=n_scales)
+    fc = pywt.central_frequency(WAVELET)
+    dt = 1.0 / fs
+    scales = fc / (freqs * dt)
+    return scales, freqs
 
-    ac_feat = layers.Multiply()([ac_feat, ac_mask_scalar])
-    vb_feat = layers.Multiply()([vb_feat, vb_mask_scalar])
-    ct_feat = layers.Multiply()([ct_feat, ct_mask_scalar])
+def clean_and_interpolate(arr):
+    arr = np.array(arr, dtype=float, copy=True)
+    arr[~np.isfinite(arr)] = np.nan
+    if np.isnan(arr).all():
+        return np.zeros_like(arr)
+    n = len(arr)
+    inds = np.arange(n)
+    good = ~np.isnan(arr)
+    return np.interp(inds, inds[good], arr[good])
 
-    fusion = layers.Concatenate()([ac_feat, vb_feat, ct_feat, mask_in])
-    x = layers.Dense(256, activation='relu')(fusion)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(128, activation='relu')(x)
-    out = layers.Dense(n_classes, activation='softmax')(x)
+def compute_cwt_scalogram(sig: np.ndarray, fs: float, scales: np.ndarray) -> np.ndarray:
+    sig = signal.detrend(sig)
+    coef, _ = pywt.cwt(sig, scales, WAVELET, sampling_period=1.0/fs)
+    power = np.abs(coef).astype(np.float32)  # (F, T)
+    return power
 
-    model = models.Model([ac_in, vb_in, ct_in, mask_in], out)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=lr),
-                  loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    return model
+def select_even_windows(total_len: int, win_len: int, n: int) -> List[int]:
+    if total_len < win_len:
+        return [0]
+    if n <= 1:
+        return [(total_len - win_len)//2]
+    last_start = total_len - win_len
+    return [int(round(i * last_start / (n-1))) for i in range(n)]
 
-# ---------------- helper: conservative first-window reader ----------------
-def first_window_from_csv(path, expected_channels, target_fs=TARGET_FS, window_secs=WINDOW_SECS, max_rows=20000):
-    if path is None:
-        return None
-    try:
-        df = pd.read_csv(path, nrows=max_rows)
-    except Exception:
-        return None
-    if "Time Stamp" not in df.columns:
-        return None
-    meta_cols = [c for c in ("load","condition","severity") if c in df.columns]
-    data_cols = [c for c in df.columns if c not in (["Time Stamp"] + meta_cols)]
-    if len(data_cols) == 0:
-        return None
-    t = df["Time Stamp"].to_numpy(dtype=float)
-    x = df[data_cols].to_numpy(dtype=float)
+def fig_to_image_array(fig) -> np.ndarray:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    img = Image.open(buf).convert("RGB")
+    return np.array(img)
 
-    if x.shape[1] < expected_channels:
-        pad = np.full((x.shape[0], expected_channels - x.shape[1]), np.nan)
-        x = np.concatenate([x, pad], axis=1)
-    elif x.shape[1] > expected_channels:
-        x = x[:, :expected_channels]
-
-    start = t[0]
-    stop = start + window_secs
-    dt = 1.0 / target_fs
-    t_new = np.arange(start, stop, dt)
-    if t_new.size == 0:
-        return None
-
-    x_new = np.zeros((len(t_new), expected_channels), dtype=np.float32)
-    for ch in range(expected_channels):
-        col = x[:, ch].astype(float)
-        mask = np.isnan(col)
-        if np.all(mask):
-            col[:] = 0.0
-        else:
-            if np.any(mask):
-                idx = np.arange(len(col)); good = idx[~mask]; vals = col[~mask]
-                col[:good[0]] = vals[0]; col[good[-1]+1:] = vals[-1]
-                col[mask] = np.interp(idx[mask], good, vals)
-        f = interpolate.interp1d(t, col, kind='linear', bounds_error=False, fill_value="extrapolate")
-        x_new[:, ch] = f(t_new).astype(np.float32)
-
-    if x_new.shape[0] < SEQ_LEN:
-        pad_rows = SEQ_LEN - x_new.shape[0]
-        x_new = np.vstack([x_new, np.zeros((pad_rows, expected_channels), dtype=np.float32)])
-    elif x_new.shape[0] > SEQ_LEN:
-        x_new = x_new[:SEQ_LEN, :]
-    return x_new
-
-
-def standardize_window(win):
-    m = np.nanmean(win, axis=0, keepdims=True)
-    s = np.nanstd(win, axis=0, keepdims=True)
-    s[s <= 1e-6] = 1.0
-    out = (win - m) / s
-    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-    return out.astype(np.float32)
-
-# ---------------- helper: infer classes ----------------
-def infer_classes_from_labelmap_or_files():
-    if os.path.exists(LABEL_MAP_PATH):
-        with open(LABEL_MAP_PATH, "r") as f:
-            class_to_idx = json.load(f)
-        idx_to_class = {int(v): k for k, v in class_to_idx.items()}
-        return idx_to_class
-    # else fallback: try to scan sample dirs
-    def basename_noext(p): return os.path.splitext(os.path.basename(p))[0]
-    files = []
-    for d in (CURRENT_DIR, VIBRATION_DIR, ACOUSTIC_DIR):
-        files += glob.glob(os.path.join(d, "*.csv"))
-    classes = set()
-    for p in files:
-        try:
-            df = pd.read_csv(p, nrows=1)
-            if "condition" in df.columns:
-                classes.add(str(df["condition"].iloc[0]))
-        except Exception:
-            pass
-    if len(classes) == 0:
-        return None
-    classes = sorted(list(classes))
-    idx_to_class = {i: c for i, c in enumerate(classes)}
-    return idx_to_class
-
-# ---------------- model loader ----------------
-_global_model = None
-_idx_to_class = None
-
-def get_model():
-    global _global_model, _idx_to_class
-    if _global_model is not None:
-        return _global_model, _idx_to_class
-
-    _idx_to_class = infer_classes_from_labelmap_or_files()
-    if _idx_to_class is not None:
-        n_classes = len(_idx_to_class)
+def render_scalogram_image(power: np.ndarray, freqs: np.ndarray, fs: float, title: str = "") -> np.ndarray:
+    disp = np.log10(power + 1e-12)
+    if np.isfinite(disp).any():
+        vmin, vmax = np.percentile(disp, [1, 99])
+        if vmin == vmax:
+            vmax = vmin + 1e-6
     else:
-        n_classes = 6
-        _idx_to_class = {i: str(i) for i in range(n_classes)}
-
-    if os.path.exists(CLEAN_MODEL_PATH):
-        try:
-            print(f"Loading clean model from {CLEAN_MODEL_PATH}")
-            _global_model = keras.models.load_model(CLEAN_MODEL_PATH, custom_objects={"MaskSliceLayer": MaskSliceLayer})
-            return _global_model, _idx_to_class
-        except Exception as e:
-            print("Failed to load clean model:", e)
-
-    # rebuild and try load weights from original HDF5 by-name
-    _global_model = build_clean_model(n_classes=n_classes)
-    if os.path.exists(ORIG_MODEL_PATH):
-        try:
-            _global_model.load_weights(ORIG_MODEL_PATH, by_name=True, skip_mismatch=True)
-            # save clean copy
-            os.makedirs(MODELS_DIR, exist_ok=True)
-            _global_model.save(CLEAN_MODEL_PATH)
-            return _global_model, _idx_to_class
-        except Exception as e:
-            raise RuntimeError("Failed to load weights from ORIG_MODEL_PATH: " + str(e))
-    else:
-        raise FileNotFoundError(f"No model file found at {CLEAN_MODEL_PATH} or {ORIG_MODEL_PATH}")
-
-# ---------------- prediction wrapper used by Gradio ----------------
-def predict_from_upload(ac_file, vb_file, ct_file):
-    # save uploaded files (they may be file-like objects)
-    def save_tmp(f):
-        if f is None:
-            return None
-        if hasattr(f, "name") and os.path.exists(f.name):
-            return f.name
-        fd, path = tempfile.mkstemp(suffix=".csv")
-        os.close(fd)
-        # gradio file-like objects may be bytes; handle both
-        try:
-            data = f.read()
-        except Exception:
-            # sometimes f is a dict with 'name'
-            if isinstance(f, dict) and 'name' in f:
-                return f['name']
-            return None
-        with open(path, "wb") as out:
-            if isinstance(data, str):
-                out.write(data.encode())
-            else:
-                out.write(data)
-        return path
-
-    ac_path = save_tmp(ac_file)
-    vb_path = save_tmp(vb_file)
-    ct_path = save_tmp(ct_file)
-
-    ac_win = first_window_from_csv(ac_path, AC_CH) if ac_path else None
-    vb_win = first_window_from_csv(vb_path, VB_CH) if vb_path else None
-    ct_win = first_window_from_csv(ct_path, CT_CH) if ct_path else None
-
-    if ac_win is None and vb_win is None and ct_win is None:
-        # For Gradio Label component, return a dict mapping label->probability
-        return {"no data": 0.0}, None
-
-    if ac_win is None:
-        ac_win = np.zeros((SEQ_LEN, AC_CH), dtype=np.float32)
-    if vb_win is None:
-        vb_win = np.zeros((SEQ_LEN, VB_CH), dtype=np.float32)
-    if ct_win is None:
-        ct_win = np.zeros((SEQ_LEN, CT_CH), dtype=np.float32)
-
-    ac_s = standardize_window(ac_win)
-    vb_s = standardize_window(vb_win)
-    ct_s = standardize_window(ct_win)
-
-    mask = np.array([[1.0 if ac_path else 0.0, 1.0 if vb_path else 0.0, 1.0 if ct_path else 0.0]], dtype=np.float32)
-
-    model, idx_to_class = get_model()
-    preds = model.predict([np.expand_dims(ac_s,0), np.expand_dims(vb_s,0), np.expand_dims(ct_s,0), mask], verbose=0)
-    top_idx = int(np.argmax(preds, axis=1)[0])
-    top_label = idx_to_class.get(top_idx, str(top_idx))
-    top_prob = float(np.max(preds))
-
-    # make a simple plot of the three inputs
-    fig, axs = plt.subplots(3, 1, figsize=(6, 6))
-    times = np.arange(SEQ_LEN) / TARGET_FS
-    axs[0].plot(times, ac_s.squeeze())
-    axs[0].set_title(f"Acoustic (channels={AC_CH})")
-    axs[1].plot(times, vb_s)
-    axs[1].set_title(f"Vibration (channels={VB_CH})")
-    axs[2].plot(times, ct_s)
-    axs[2].set_title(f"Current (channels={CT_CH})")
+        vmin, vmax = disp.min(), disp.max() + 1e-6
+    fig = plt.figure(figsize=(5, 3))
+    extent = [0, power.shape[1]/fs, freqs[0], freqs[-1]]
+    plt.imshow(disp, aspect="auto", origin="lower", extent=extent, vmin=vmin, vmax=vmax, cmap="viridis")
+    plt.yscale("log")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Frequency (Hz)")
+    if title:
+        plt.title(title)
     plt.tight_layout()
+    return fig_to_image_array(fig)
 
-    # Return dict mapping label->prob (Gradio label expects this format)
-    label_out = {str(top_label): float(top_prob)}
+# --------------------------- MODEL ---------------------------
+class ConvBlock(nn.Module):
+    def __init__(self, c_in, c_out, k=3, p=1, s=1):
+        super().__init__()
+        self.conv = nn.Conv2d(c_in, c_out, k, stride=s, padding=p)
+        self.bn   = nn.BatchNorm2d(c_out)
+        self.act  = nn.ReLU(inplace=True)
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
 
-    # close figure handling is left to gradio; return fig object
-    return label_out, fig
+class MultiTaskCNN(nn.Module):
+    """
+    Matches training: in_ch=1 for acoustic, in_ch=4 for vibration (4-channel fusion).
+    """
+    def __init__(self, n_cond: int, n_sev: int, in_ch: int):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            ConvBlock(in_ch, 32, 5, 2),
+            nn.MaxPool2d((2, 4)),          # ↓F x2, ↓T x4
+            ConvBlock(32, 64, 3, 1),
+            nn.MaxPool2d((2, 2)),
+            ConvBlock(64, 128, 3, 1),
+            nn.AdaptiveAvgPool2d((4, 8)),
+        )
+        feat_dim = 128 * 4 * 8
+        self.drop = nn.Dropout(0.2)
+        self.fc_cond = nn.Linear(feat_dim, n_cond)
+        self.fc_sev  = nn.Linear(feat_dim, n_sev)
+    def forward(self, x):
+        z = self.backbone(x)
+        z = z.flatten(1)
+        z = self.drop(z)
+        return self.fc_cond(z), self.fc_sev(z)
 
-# ---------------- Gradio UI ----------------
-with gr.Blocks() as demo:
-    gr.Markdown("# Multimodal Signal Predictor\nUpload CSVs for acoustic, vibration, and current signals (optional).\nFiles must contain a `Time Stamp` column and signal columns.")
+def load_model_and_labels(weights_path: str, labels_json: str, in_ch: int):
+    with open(labels_json, "r") as fh:
+        lab = json.load(fh)
+    conds = lab["conditions"]
+    sevs  = lab["severities"]
+    model = MultiTaskCNN(n_cond=len(conds), n_sev=len(sevs), in_ch=in_ch).to(DEVICE)
+    state = torch.load(weights_path, map_location=DEVICE)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    return model, conds, sevs
+
+# --------------------------- INFERENCE HELPERS ---------------------------
+@torch.inference_mode()
+def predict_acoustic_scalos(model: nn.Module, scalos: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    ps_c, ps_s = [], []
+    for arr in scalos:
+        X = arr.astype(np.float32, copy=False)
+        X = np.log1p(X)
+        mu, sd = X.mean(), X.std() + 1e-6
+        X = (X - mu) / sd
+        X = np.expand_dims(X, 0)  # (1,F,T)
+        X = np.expand_dims(X, 0)  # (B=1,1,F,T)
+        xb = torch.from_numpy(X).to(DEVICE, non_blocking=True)
+        if AMP_ENABLED:
+            with torch.cuda.amp.autocast():
+                pc, ps = model(xb)
+        else:
+            pc, ps = model(xb)
+        ps_c.append(pc.softmax(1).squeeze(0).cpu().numpy())
+        ps_s.append(ps.softmax(1).squeeze(0).cpu().numpy())
+    p_c = np.mean(np.stack(ps_c, 0), 0)
+    p_s = np.mean(np.stack(ps_s, 0), 0)
+    return p_c, p_s
+
+@torch.inference_mode()
+def predict_vibration_4ch(model: nn.Module, scalos_4ch: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    scalos_4ch: list of arrays with shape (C=4,F,T) or (C<=4,F,T)
+    Per-channel normalization (log1p + z-score) to match training.
+    """
+    ps_c, ps_s = [], []
+    for X in scalos_4ch:
+        X = X.astype(np.float32, copy=False)
+        X = np.log1p(X)
+        mu = X.mean(axis=(1,2), keepdims=True)
+        sd = X.std(axis=(1,2), keepdims=True) + 1e-6
+        X = (X - mu) / sd
+        X = np.expand_dims(X, 0)  # (B=1,C,F,T)
+        xb = torch.from_numpy(X).to(DEVICE, non_blocking=True)
+        if AMP_ENABLED:
+            with torch.cuda.amp.autocast():
+                pc, ps = model(xb)
+        else:
+            pc, ps = model(xb)
+        ps_c.append(pc.softmax(1).squeeze(0).cpu().numpy())
+        ps_s.append(ps.softmax(1).squeeze(0).cpu().numpy())
+    p_c = np.mean(np.stack(ps_c, 0), 0)
+    p_s = np.mean(np.stack(ps_s, 0), 0)
+    return p_c, p_s
+
+def topk_table_md(title: str, names: List[str], probs: np.ndarray, k: int = 5) -> str:
+    order = np.argsort(-probs)[:k]
+    hdr = f"### {title}\n\n| Class | Prob |\n|---|---|\n"
+    rows = "".join([f"| {names[i]} | {probs[i]:.2%} |\n" for i in order])
+    return hdr + rows
+
+def top1(probs: np.ndarray, names: List[str]) -> Tuple[str, float]:
+    i = int(np.argmax(probs))
+    return names[i], float(probs[i])
+
+def ensemble_union(preds: List[Tuple[np.ndarray, List[str]]]) -> Tuple[np.ndarray, List[str]]:
+    if not preds:
+        return np.array([]), []
+    classes = sorted(set().union(*[set(names) for (_, names) in preds]))
+    idx = {c:i for i,c in enumerate(classes)}
+    acc = np.zeros(len(classes), dtype=np.float64)
+    for p, names in preds:
+        v = np.zeros(len(classes), dtype=np.float64)
+        for i, n in enumerate(names):
+            v[idx[n]] = p[i]
+        acc += v
+    acc /= len(preds)
+    s = acc.sum()
+    if s > 0: acc /= s
+    return acc.astype(np.float32), classes
+
+# --------------------------- CSV → SCALOGRAMS ---------------------------
+def csv_to_acoustic_scalos(csv_bytes: bytes, max_windows: int = N_WINDOWS_PER_FILE):
+    df = pd.read_csv(io.BytesIO(csv_bytes), low_memory=False)
+    time_col = find_time_column(df)
+    times = df[time_col].to_numpy(dtype=float)
+    fs = estimate_fs_from_times(times)
+    # acoustic fs correction as in training
+    fs /= 2.0
+
+    chans = [c for c in ACOUSTIC_CHANNELS if c in df.columns]
+    if not chans:
+        raise ValueError(f"Acoustic CSV missing expected channel. Found: {list(df.columns)}")
+
+    win_len = max(2, int(round(WINDOW_SEC * fs)))
+    total_samples = len(times)
+    starts = select_even_windows(total_samples, win_len, max_windows)
+
+    scales, freqs = prepare_scales_for_freqs(fs, N_SCALES, FREQ_MIN, FREQ_MAX_RATIO)
+
+    scalos, images = [], []
+    ch = chans[0]
+    sig_full = clean_and_interpolate(df[ch].to_numpy(copy=True))
+    for wi, s in enumerate(starts):
+        e = min(total_samples, s + win_len)
+        sig = sig_full[s:e]
+        if len(sig) < win_len:
+            sig = np.pad(sig, (0, win_len - len(sig)), mode="edge")
+        P = compute_cwt_scalogram(sig, fs, scales)  # (F,T)
+        scalos.append(P)
+        if wi == 0:
+            images.append(render_scalogram_image(P, freqs, fs, title=f"Acoustic:{ch}"))
+    return scalos, images  # images: list of 1 preview image
+
+def csv_to_vibration_4ch_scalos(csv_bytes: bytes, max_windows: int = N_WINDOWS_PER_FILE):
+    df = pd.read_csv(io.BytesIO(csv_bytes), low_memory=False)
+    time_col = find_time_column(df)
+    times = df[time_col].to_numpy(dtype=float)
+    fs = estimate_fs_from_times(times)
+
+    chans = [c for c in VIBRATION_CHANNELS if c in df.columns]
+    if not chans:
+        raise ValueError(f"Vibration CSV missing expected channels. Need any of {VIBRATION_CHANNELS}; Found: {list(df.columns)}")
+
+    win_len = max(2, int(round(WINDOW_SEC * fs)))
+    total_samples = len(times)
+    starts = select_even_windows(total_samples, win_len, max_windows)
+
+    scales, freqs = prepare_scales_for_freqs(fs, N_SCALES, FREQ_MIN, FREQ_MAX_RATIO)
+
+    # Pre-load/clean all available channels
+    series: Dict[str, np.ndarray] = {}
+    for ch in chans:
+        series[ch] = clean_and_interpolate(df[ch].to_numpy(copy=True))
+
+    groups_4ch: List[np.ndarray] = []        # each is (C<=4,F,T)
+    preview_images: List[np.ndarray] = []    # show 4 images for first window if possible
+
+    for wi, s in enumerate(starts):
+        e = min(total_samples, s + win_len)
+        per_ch_scalos: List[np.ndarray] = []
+        per_ch_images: List[np.ndarray] = []
+        present_order = [ch for ch in VIBRATION_CHANNELS if ch in series]
+        for ch in present_order:
+            sig = series[ch][s:e]
+            if len(sig) < win_len:
+                sig = np.pad(sig, (0, win_len - len(sig)), mode="edge")
+            P = compute_cwt_scalogram(sig, fs, scales)  # (F,T)
+            per_ch_scalos.append(P)
+            if wi == 0:
+                per_ch_images.append(render_scalogram_image(P, freqs, fs, title=f"Vibration:{ch}"))
+
+        # align time across channels
+        Tm = min(p.shape[1] for p in per_ch_scalos)
+        per_ch_scalos = [p[:, :Tm] for p in per_ch_scalos]
+        X = np.stack(per_ch_scalos, axis=0)  # (C,F,T)
+        groups_4ch.append(X)
+
+        if wi == 0 and per_ch_images:
+            preview_images.extend(per_ch_images)
+
+    return groups_4ch, preview_images  # images: 4 per first window (if available)
+
+# --------------------------- LAZY MODEL LOAD ---------------------------
+_acoustic_model = None
+_acoustic_cond = []
+_acoustic_sev = []
+_vib_model = None
+_vib_cond = []
+_vib_sev = []
+
+def lazy_load_models() -> str:
+    global _acoustic_model, _acoustic_cond, _acoustic_sev, _vib_model, _vib_cond, _vib_sev
+    msgs = []
+    if _acoustic_model is None and os.path.exists(ACOUSTIC_WEIGHTS) and os.path.exists(ACOUSTIC_LABELS):
+        _acoustic_model, _acoustic_cond, _acoustic_sev = load_model_and_labels(ACOUSTIC_WEIGHTS, ACOUSTIC_LABELS, in_ch=1)
+        msgs.append(f"Loaded acoustic model ({len(_acoustic_cond)} conds / {len(_acoustic_sev)} sevs)")
+    if _vib_model is None and os.path.exists(VIB_WEIGHTS) and os.path.exists(VIB_LABELS):
+        _vib_model, _vib_cond, _vib_sev = load_model_and_labels(VIB_WEIGHTS, VIB_LABELS, in_ch=4)
+        msgs.append(f"Loaded vibration model ({len(_vib_cond)} conds / {len(_vib_sev)} sevs)")
+    return "\n".join(msgs) if msgs else "Models ready."
+
+# --------------------------- GRADIO CALLBACK ---------------------------
+def run_inference(acoustic_csv, vibration_csv):
+    status = lazy_load_models()
+
+    gallery_images = []
+    details_md = []
+    summaries = []
+
+    # --- Acoustic ---
+    acoustic_pred = None
+    if acoustic_csv is not None and _acoustic_model is not None:
+        try:
+            a_bytes = read_file_like(acoustic_csv)
+            a_scalos, a_imgs = csv_to_acoustic_scalos(a_bytes, max_windows=N_WINDOWS_PER_FILE)
+            gallery_images.extend([(img, "Acoustic scalogram") for img in a_imgs])
+
+            p_c, p_s = predict_acoustic_scalos(_acoustic_model, a_scalos)
+            c1, c1p = top1(p_c, _acoustic_cond)
+            s1, s1p = top1(p_s, _acoustic_sev)
+            summaries.append(f"**Acoustic** → Condition: **{c1}** ({c1p:.2%}), Severity: **{s1}** ({s1p:.2%})")
+            details_md.append(topk_table_md("Acoustic — Condition (Top 5)", _acoustic_cond, p_c, k=min(5,len(_acoustic_cond))))
+            details_md.append(topk_table_md("Acoustic — Severity (Top 5)",  _acoustic_sev,  p_s, k=min(5,len(_acoustic_sev))))
+            acoustic_pred = (p_c, _acoustic_cond, p_s, _acoustic_sev)
+        except Exception as e:
+            summaries.append(f"Acoustic error: {e}")
+
+    # --- Vibration (4-channel fusion) ---
+    vibration_pred = None
+    if vibration_csv is not None and _vib_model is not None:
+        try:
+            v_bytes = read_file_like(vibration_csv)
+            v_groups, v_imgs = csv_to_vibration_4ch_scalos(v_bytes, max_windows=N_WINDOWS_PER_FILE)
+            gallery_images.extend([(img, "Vibration scalogram") for img in v_imgs])
+
+            p_c, p_s = predict_vibration_4ch(_vib_model, v_groups)
+            c1, c1p = top1(p_c, _vib_cond)
+            s1, s1p = top1(p_s, _vib_sev)
+            summaries.append(f"**Vibration** → Condition: **{c1}** ({c1p:.2%}), Severity: **{s1}** ({s1p:.2%})")
+            details_md.append(topk_table_md("Vibration — Condition (Top 5)", _vib_cond, p_c, k=min(5,len(_vib_cond))))
+            details_md.append(topk_table_md("Vibration — Severity (Top 5)",  _vib_sev,  p_s, k=min(5,len(_vib_sev))))
+            vibration_pred = (p_c, _vib_cond, p_s, _vib_sev)
+        except Exception as e:
+            summaries.append(f"Vibration error: {e}")
+
+    # --- Ensemble across modalities (if both present) ---
+    ensemble_md = ""
+    if acoustic_pred and vibration_pred:
+        a_pc, a_cnames, a_ps, a_snames = acoustic_pred
+        v_pc, v_cnames, v_ps, v_snames = vibration_pred
+        ens_c, ens_cnames = ensemble_union([(a_pc, a_cnames), (v_pc, v_cnames)])
+        ens_s, ens_snames = ensemble_union([(a_ps, a_snames), (v_ps, v_snames)])
+        if ens_c.size:
+            ec, ecp = top1(ens_c, ens_cnames)
+            ensemble_md += f"**Ensemble** → Condition: **{ec}** ({ecp:.2%})\n\n"
+            ensemble_md += topk_table_md("Ensemble — Condition (Top 5)", ens_cnames, ens_c, k=min(5,len(ens_cnames))) + "\n"
+        if ens_s.size:
+            es, esp = top1(ens_s, ens_snames)
+            ensemble_md += f"**Ensemble** → Severity: **{es}** ({esp:.2%})\n\n"
+            ensemble_md += topk_table_md("Ensemble — Severity (Top 5)", ens_snames, ens_s, k=min(5,len(ens_snames)))
+    else:
+        ensemble_md = "_Ensemble shown when both modalities are provided._"
+
+    status_out = status if status else "Models ready."
+    summary_out = "\n\n".join(summaries) if summaries else "Upload at least one CSV."
+    details_out = ensemble_md + ("\n\n" if ensemble_md else "") + ("\n\n".join(details_md) if details_md else "—")
+    return status_out, summary_out, details_out, gallery_images
+
+# --------------------------- UI ---------------------------
+with gr.Blocks(title="Acoustic + Vibration (4-Ch) Fault Inference") as demo:
+    gr.Markdown(
+        """
+        # 🛠️ Acoustic + Vibration (4-Channel) — Fault Condition & Severity
+        Upload **acoustic** and/or **vibration** CSVs.  
+        We compute **Morlet CWT scalograms** on several windows, show them, and predict with your trained models.
+        - Acoustic: single-channel
+        - Vibration: fused **4-channel** (x_A, y_A, x_B, y_B) per window
+        """
+    )
     with gr.Row():
-        with gr.Column():
-            ac_in = gr.File(label="Acoustic CSV (1 channel)", file_types=['.csv'])
-            vb_in = gr.File(label="Vibration CSV (up to 4 channels)", file_types=['.csv'])
-            ct_in = gr.File(label="Current CSV (up to 5 channels)", file_types=['.csv'])
-            predict_btn = gr.Button("Predict")
-        with gr.Column():
-            # Label expects a mapping of label->prob or a list of (label, prob)
-            output_label = gr.Label(num_top_classes=3, label="Prediction")
-            plot_out = gr.Plot(label="Standardized windows")
+        acoustic_in = gr.File(label="Acoustic CSV (must have 'values' column)", file_types=[".csv"])
+        vibration_in = gr.File(label="Vibration CSV (x/y A/B columns)", file_types=[".csv"])
+    run_btn = gr.Button("Run Inference 🚀", variant="primary")
 
-    predict_btn.click(fn=predict_from_upload, inputs=[ac_in, vb_in, ct_in], outputs=[output_label, plot_out])
+    status = gr.Markdown("Models will load on first run.")
+    summary = gr.Markdown()
+    details = gr.Markdown()
 
-if __name__ == '__main__':
+    gr.Markdown("### Preview Scalograms")
+    gallery = gr.Gallery(label="Scalograms", show_label=False, height=360, columns=2)
+
+    run_btn.click(
+        run_inference,
+        inputs=[acoustic_in, vibration_in],
+        outputs=[status, summary, details, gallery],
+    )
+
+if __name__ == "__main__":
+    print(f"Device: {DEVICE} | CUDA: {USE_CUDA} | AMP: {AMP_ENABLED}")
     demo.launch()
