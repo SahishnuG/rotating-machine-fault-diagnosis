@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-alt rounded-4 p-4 p-md-5 mb-4">
+  <h2 class="h4 mb-2">Results</h2>
+  <p class="mb-0">Predictions averaged across windows. Ensemble shown when both modalities are present.</p>
+</section>
+
+{% if previews and previews|length %}
+<h5 class="mb-3">Scalograms</h5>
+<div class="row row-cols-1 row-cols-md-2 g-4 mb-4">
+  {% for title, src in previews %}
+  <div class="col">
+    <div class="card h-100 border-0 shadow-sm">
+      <div class="ratio ratio-16x9">
+        <img src="{{ src }}" class="card-img-top object-fit-contain" alt="{{ title }}">
+      </div>
+      <div class="card-body">
+        <div class="card-title fw-semibold">{{ title }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="row g-4">
+  <div class="col-12 col-lg-4">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Summary</h5>
+        {% if summaries and summaries|length %}
+          <ul class="list-group list-group-flush">
+          {% for name, c, cp, s, sp in summaries %}
+            {% if name == "Acoustic" or name == "Vibration" %}
+            <li class="list-group-item bg-transparent">
+              <div class="fw-semibold">{{ name }}</div>
+              <div>Condition: <b>{{ c }}</b> ({{ "%.2f"|format(cp*100) }}%)</div>
+              <div>Severity: <b>{{ s }}</b> ({{ "%.2f"|format(sp*100) }}%)</div>
+            </li>
+            {% else %}
+            <li class="list-group-item bg-transparent text-danger">{{ name }}: {{ c }}</li>
+            {% endif %}
+          {% endfor %}
+          </ul>
+        {% else %}
+          <div class="text-secondary">No predictions generated.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-4">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Top-5 Probabilities (Per Modality)</h5>
+        {% if details.acoustic_cond_top %}
+          <h6 class="mt-3">Acoustic — Condition</h6>
+          <table class="table table-sm align-middle small">
+            <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+            <tbody>
+              {% for n,p in details.acoustic_cond_top %}
+              <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+        {% if details.acoustic_sev_top %}
+          <h6 class="mt-3">Acoustic — Severity</h6>
+          <table class="table table-sm align-middle small">
+            <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+            <tbody>
+              {% for n,p in details.acoustic_sev_top %}
+              <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+
+        {% if details.vibration_cond_top %}
+          <h6 class="mt-4">Vibration — Condition</h6>
+          <table class="table table-sm align-middle small">
+            <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+            <tbody>
+              {% for n,p in details.vibration_cond_top %}
+              <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+        {% if details.vibration_sev_top %}
+          <h6 class="mt-3">Vibration — Severity</h6>
+          <table class="table table-sm align-middle small">
+            <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+            <tbody>
+              {% for n,p in details.vibration_sev_top %}
+              <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12 col-lg-4">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-body">
+        <h5 class="card-title">Ensemble (if both)</h5>
+        {% if ensemble.cond_top1 or ensemble.sev_top1 %}
+          {% if ensemble.cond_top1 %}
+            <div class="mb-2">Condition: <b>{{ ensemble.cond_top1[0] }}</b> ({{ "%.2f"|format(ensemble.cond_top1[1]*100) }}%)</div>
+            <table class="table table-sm align-middle small">
+              <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+              <tbody>
+                {% for n,p in ensemble.cond_table %}
+                <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+          {% if ensemble.sev_top1 %}
+            <div class="mb-2">Severity: <b>{{ ensemble.sev_top1[0] }}</b> ({{ "%.2f"|format(ensemble.sev_top1[1]*100) }}%)</div>
+            <table class="table table-sm align-middle small">
+              <thead><tr><th>Class</th><th>Prob</th></tr></thead>
+              <tbody>
+                {% for n,p in ensemble.sev_table %}
+                <tr><td>{{ n }}</td><td>{{ "%.2f"|format(p*100) }}%</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+        {% else %}
+          <div class="text-secondary">Ensemble shown when both modalities are provided.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="d-flex gap-2 mt-4">
+  <form method="post" action="{{ url_for('cleanup', job_id=job_id) }}">
+    <button class="btn btn-outline-danger" type="submit">Discard Session</button>
+  </form>
+  <a class="btn btn-secondary" href="{{ url_for('index') }}">New Upload</a>
+</div>
+{% endblock %}

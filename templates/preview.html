@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero hero-alt rounded-4 p-4 p-md-5 mb-4">
+  <h2 class="h4 mb-2">Preview Scalograms</h2>
+  <p class="mb-0">Inspect the time–frequency content. When ready, run predictions.</p>
+</section>
+
+{% if errors and errors|length %}
+  <div class="alert alert-danger">
+    <ul class="mb-0">
+      {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+  </div>
+{% endif %}
+
+{% if previews and previews|length %}
+<div class="row row-cols-1 row-cols-md-2 g-4 mb-4">
+  {% for title, src in previews %}
+  <div class="col">
+    <div class="card h-100 border-0 shadow-sm">
+      <div class="ratio ratio-16x9">
+        <img src="{{ src }}" class="card-img-top object-fit-contain" alt="{{ title }}">
+      </div>
+      <div class="card-body">
+        <div class="card-title fw-semibold">{{ title }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+  <div class="alert alert-warning">No preview images were generated.</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('predict') }}" class="d-flex align-items-center gap-3">
+  <input type="hidden" name="job_id" value="{{ job_id }}">
+  <button class="btn btn-success btn-lg" type="submit"
+          {% if not acoustic_ready and not vibration_ready %} disabled {% endif %}>
+    Run Prediction
+  </button>
+  {% if not acoustic_ready and not vibration_ready %}
+    <span class="text-secondary">Model files not found or no valid inputs.</span>
+  {% endif %}
+</form>
+
+<form method="post" action="{{ url_for('cleanup', job_id=job_id) }}" class="mt-3">
+  <button class="btn btn-outline-danger btn-sm" type="submit">Discard Session</button>
+</form>
+{% endblock %}

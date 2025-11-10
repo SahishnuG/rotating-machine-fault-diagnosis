@@ -1,0 +1,18 @@
+:root {
+  --hero-grad: radial-gradient(1200px 600px at 10% 10%, rgba(56,189,248,.25), transparent 60%),
+               radial-gradient(800px 400px at 90% 0%, rgba(34,197,94,.22), transparent 60%),
+               radial-gradient(1000px 500px at 50% 100%, rgba(168,85,247,.18), transparent 60%);
+}
+
+.hero {
+  background: var(--hero-grad);
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.hero-alt {
+  background: radial-gradient(1000px 600px at 30% 20%, rgba(99,102,241,.18), transparent 60%),
+              radial-gradient(900px 500px at 100% 10%, rgba(20,184,166,.18), transparent 60%);
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.object-fit-contain { object-fit: contain; }
