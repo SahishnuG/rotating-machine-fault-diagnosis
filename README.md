@@ -15,18 +15,32 @@
 11. python main.py to run the final gradio app
 12. Input acoustic and vibration sensor csv data in the app to predict condition (error or normal) and severity (how severe the error is, if any)
 
-## See project_understanding.docx to better understand the project
 
+
+### System architecture:
+### Model architecture:
 ```mermaid
-flowchart TB;
-    A1["Acoustic CSVs"] --> B["preprocess.py <br> (Morlet CWT)"]
-    A2["Vibration CSVs"] --> B
-    B --> C1["Acoustic Scalograms<br>(1 channel)"] & C2["Vibration Scalograms<br>(4 channels)"]
-    C1 --> D1["Acoustic Clients"]
-    C2 --> D2["Vibration Clients"]
-    D1 --> E["Local Training <br> (MultiTask CNN)"]
-    D2 --> E
-    E --> F["FedAvg <br> (Global Model Update)"]
-    F --> G["Full-Coverage Fine-Tune <br> (on All Data)"]
-    G --> H["Trained Model <br> (Condition + Severity)"]
+flowchart TB
+ subgraph Backbone["Backbone"]
+    direction LR
+        CB1["ConvBlock #1<br>Conv2d(in_ch-&gt;32, k=5, s=1, p=2)<br>BatchNorm2d(32) + ReLU"]
+        MP1["MaxPool2d(2,4)"]
+        CB2["ConvBlock #2<br>Conv2d(32-&gt;64, k=3, s=1, p=1)<br>BatchNorm2d(64) + ReLU"]
+        MP2["MaxPool2d(2,2)"]
+        CB3["ConvBlock #3<br>Conv2d(64-&gt;128, k=3, s=1, p=1)<br>BatchNorm2d(128) + ReLU"]
+        GAP["AdaptiveAvgPool2d(4,8)"]
+  end
+    I["Input<br>[B, in_ch, F, T]"] --> CB1
+    CB1 --> MP1
+    MP1 --> CB2
+    CB2 --> MP2
+    MP2 --> CB3
+    CB3 --> GAP
+    GAP --> FLAT["Flatten -> 4096"]
+    FLAT --> DROP["Dropout p=0.2"]
+    DROP --> Hc["Head: Condition<br>Linear(4096-&gt;n_cond)"] & Hs["Head: Severity<br>Linear(4096-&gt;n_sev)"]
+    Hc -.-> Lc["CrossEntropyLoss (label_smoothing=0.1)"]
+    Hs -.-> Ls["CrossEntropyLoss (label_smoothing=0.1)"]
+    I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
 ```
+<b>See project_understanding.docx to better understand the project<b>
