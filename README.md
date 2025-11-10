@@ -1,5 +1,5 @@
 # How to run
-### Note: the models are already trained and stored in models/ so you can directly run main.py
+### Note: the models are already trained and stored in models/ so you can directly run app.py
 1. Download [Vibration, Acoustic, Temperature, and Motor Current Dataset of Rotating Machine Under Varying Load Conditions for Fault Diagnosis](https://data.mendeley.com/datasets/ztmf3m7h5x/6) and extract it in your local machine
 2. Extract acoustic, current,temp and vibration
 3. clone this repo and add the extracted folders in the repo (same dir as main.py)
