@@ -1,3 +1,9 @@
-If you use this work in academic publications, please cite:
-
-Sahishnu G (2025). Rotating machine fault diagnosis. GitHub repo: https://github.com/SahishnuG/rotating-machine-fault-diagnosis/
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ROTATING MACHINE FAULT DIAGNOSIS"
+authors:
+  - family-names: "G"
+    given-names: "Sahishnu"
+version: "1.0.0"
+date-released: "2025-11-11"     # ← Use YYYY-MM-DD format
+url: "https://github.com/SahishnuG/rotating-machine-fault-diagnosis"
