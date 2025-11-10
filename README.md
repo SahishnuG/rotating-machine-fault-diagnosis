@@ -14,7 +14,7 @@
 10. Optional - python test_cnn.py
 11. Optional (or if the flask app isnt working fsr) - python main.py to run the gradio app
 12. python app.py to run the final flask app
-13. Input acoustic and vibration sensor csv data in the app to predict condition (error or normal) and severity (how severe the error is, if any)
+13. Input acoustic and vibration sensor csv data in the app to predict condition (type of error or normal) and severity (how severe the error is, if any)
 
 ### System architecture:
 ```mermaid
