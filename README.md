@@ -144,12 +144,4 @@ flowchart TB;
     I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
 ```
 
-**See project_understanding.docx to better understand the project**thing=0.1)"]
-    I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
-```
-
-**See project_understanding.docx to better understand the project**thing=0.1)"]
-    I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
-```
-
 **See project_understanding.docx to better understand the project**
