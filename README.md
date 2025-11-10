@@ -16,3 +16,17 @@
 12. Input acoustic and vibration sensor csv data in the app to predict condition (error or normal) and severity (how severe the error is, if any)
 
 ## See project_understanding.docx to better understand the project
+
+```mermaid
+flowchart TB;
+    A1["Acoustic CSVs"] --> B["preprocess.py <br> (Morlet CWT)"]
+    A2["Vibration CSVs"] --> B
+    B --> C1["Acoustic Scalograms<br>(1 channel)"] & C2["Vibration Scalograms<br>(4 channels)"]
+    C1 --> D1["Acoustic Clients"]
+    C2 --> D2["Vibration Clients"]
+    D1 --> E["Local Training <br> (MultiTask CNN)"]
+    D2 --> E
+    E --> F["FedAvg <br> (Global Model Update)"]
+    F --> G["Full-Coverage Fine-Tune <br> (on All Data)"]
+    G --> H["Trained Model <br> (Condition + Severity)"]
+```
