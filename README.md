@@ -12,8 +12,9 @@
 9. python train_cnn.py --cuda --amp --batch-size 16 --rounds 5 --clients-per-round 5 --fl-col-stride 16 --fl-time-crop 512 --fl-freq-end 128 --full-col-stride 8 --full-tile-len 1024 --full-tile-overlap 256 --full-ft-epochs 2  
 (I have given some default args to prevent memory overflow while still training on most of the data)
 10. Optional - python test_cnn.py
-11. python main.py to run the final gradio app
-12. Input acoustic and vibration sensor csv data in the app to predict condition (error or normal) and severity (how severe the error is, if any)
+11. Optional (or if the flask app isnt working fsr) - python main.py to run the gradio app
+12. python app.py to run the final flask app
+13. Input acoustic and vibration sensor csv data in the app to predict condition (error or normal) and severity (how severe the error is, if any)
 
 ### System architecture:
 ```mermaid
@@ -140,6 +141,14 @@ flowchart TB;
     DROP --> Hc["Head: Condition<br>Linear(4096-&gt;n_cond)"] & Hs["Head: Severity<br>Linear(4096-&gt;n_sev)"]
     Hc -.-> Lc["CrossEntropyLoss (label_smoothing=0.1)"]
     Hs -.-> Ls["CrossEntropyLoss (label_smoothing=0.1)"]
+    I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
+```
+
+**See project_understanding.docx to better understand the project**thing=0.1)"]
+    I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
+```
+
+**See project_understanding.docx to better understand the project**thing=0.1)"]
     I --- Note1["in_ch = 1 (acoustic) or 4 (vibration)"]
 ```
 
